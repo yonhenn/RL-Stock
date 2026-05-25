@@ -5,14 +5,16 @@ from __future__ import annotations
 import os
 import random
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import numpy as np
 import torch
-from stable_baselines3 import A2C, PPO
+from stable_baselines3 import A2C, PPO, SAC, TD3
 
 from rl_stock.config import ExperimentConfig
 from rl_stock.data import load_market_data, split_frame_bounds
 from rl_stock.envs import ShanghaiIndexEnvT1
+from rl_stock.envs_v2 import PositionMgmtEnv, RiskConfig
 from rl_stock.evaluation import ProgressBarCallback, evaluate_model, print_stats
 
 
@@ -25,6 +27,10 @@ class ExperimentArtifacts:
     results: dict
     train_frame_bound: tuple[int, int]
     test_frame_bound: tuple[int, int]
+    env_type: str
+
+
+TrainFn = Callable[[Any, int, int], Any]
 
 
 def set_seed(seed: int) -> None:
@@ -77,6 +83,113 @@ def train_ppo(train_env, seed: int, total_timesteps: int):
     return model
 
 
+def train_sac(train_env, seed: int, total_timesteps: int):
+    """Train SAC -- recommended for continuous position management."""
+    model = SAC(
+        "MlpPolicy",
+        train_env,
+        verbose=0,
+        seed=seed,
+        learning_rate=3e-4,
+        buffer_size=100_000,
+        batch_size=256,
+        tau=0.005,
+        gamma=0.99,
+        ent_coef="auto",
+        policy_kwargs={"net_arch": [256, 256]},
+    )
+    model.learn(total_timesteps=total_timesteps, callback=ProgressBarCallback())
+    return model
+
+
+def train_td3(train_env, seed: int, total_timesteps: int):
+    """Train TD3 for comparison against SAC on continuous actions."""
+    action_dim = int(np.prod(train_env.action_space.shape))
+    from stable_baselines3.common.noise import NormalActionNoise
+
+    action_noise = NormalActionNoise(
+        mean=np.zeros(action_dim), sigma=0.1 * np.ones(action_dim)
+    )
+    model = TD3(
+        "MlpPolicy",
+        train_env,
+        verbose=0,
+        seed=seed,
+        learning_rate=3e-4,
+        buffer_size=100_000,
+        batch_size=256,
+        tau=0.005,
+        gamma=0.99,
+        action_noise=action_noise,
+        policy_kwargs={"net_arch": [256, 256]},
+    )
+    model.learn(total_timesteps=total_timesteps, callback=ProgressBarCallback())
+    return model
+
+
+_TRAINERS: dict[str, TrainFn] = {
+    "A2C": train_a2c,
+    "PPO": train_ppo,
+    "SAC": train_sac,
+    "TD3": train_td3,
+}
+
+_CONTINUOUS_ONLY = {"SAC", "TD3"}
+
+
+def _build_envs(config: ExperimentConfig, df, train_bound, test_bound):
+    if config.env_type == "t1":
+        train_env = ShanghaiIndexEnvT1(
+            df=df, window_size=config.window_size, frame_bound=train_bound
+        )
+        test_env = ShanghaiIndexEnvT1(
+            df=df, window_size=config.window_size, frame_bound=test_bound
+        )
+        return train_env, test_env
+
+    if config.env_type == "position":
+        risk = RiskConfig(
+            initial_cash=config.initial_cash,
+            max_position=config.max_position,
+            stop_loss_pct=config.stop_loss_pct,
+            max_drawdown_pct=config.max_drawdown_pct,
+            trade_fee_rate=config.trade_fee_rate,
+            vol_target=config.vol_target,
+            drawdown_coeff=config.drawdown_coeff,
+            turnover_coeff=config.turnover_coeff,
+            sharpe_coeff=config.sharpe_coeff,
+            dsr_eta=config.dsr_eta,
+        )
+        train_env = PositionMgmtEnv(
+            df=df,
+            window_size=config.window_size,
+            frame_bound=train_bound,
+            risk_config=risk,
+        )
+        test_env = PositionMgmtEnv(
+            df=df,
+            window_size=config.window_size,
+            frame_bound=test_bound,
+            risk_config=risk,
+        )
+        return train_env, test_env
+
+    raise ValueError(f"Unknown env_type: {config.env_type!r}")
+
+
+def _resolve_algorithms(env_type: str, requested: tuple[str, ...]) -> list[str]:
+    resolved: list[str] = []
+    for name in requested:
+        upper = name.upper()
+        if upper not in _TRAINERS:
+            raise ValueError(f"Unknown algorithm: {name!r}")
+        if env_type == "t1" and upper in _CONTINUOUS_ONLY:
+            print(f"Skipping {upper}: continuous-action algo not compatible with env_type=t1.")
+            continue
+        resolved.append(upper)
+    return resolved
+
+
 def run_experiment(config: ExperimentConfig) -> ExperimentArtifacts:
     """Load data, create environments, train models, and evaluate them."""
     set_seed(config.seed)
@@ -88,64 +201,48 @@ def run_experiment(config: ExperimentConfig) -> ExperimentArtifacts:
         test_start_date=config.test_start_date,
     )
 
-    train_env = ShanghaiIndexEnvT1(
-        df=df,
-        window_size=config.window_size,
-        frame_bound=train_frame_bound,
-    )
-    test_env = ShanghaiIndexEnvT1(
-        df=df,
-        window_size=config.window_size,
-        frame_bound=test_frame_bound,
-    )
+    train_env, test_env = _build_envs(config, df, train_frame_bound, test_frame_bound)
 
     print(f"Data shape: {df.shape}")
     print(f"Date range: {df.index.min()} to {df.index.max()}")
+    print(f"Environment: {config.env_type}")
     print(f"Training frame: {train_frame_bound}")
     print(f"Test frame: {test_frame_bound}")
     print(f"Observation space: {train_env.observation_space.shape}")
     print(f"Action space: {train_env.action_space}")
 
-    results = {}
-    models = {}
+    results: dict = {}
+    models: dict = {}
 
     print("\nEvaluating random strategy baseline...")
-    random_rewards, random_profits = evaluate_model(
+    random_rewards, random_profits, random_infos = evaluate_model(
         None,
         test_env,
         config.num_eval_episodes,
         config.seed,
     )
-    results["Random"] = {"rewards": random_rewards, "profits": random_profits}
+    results["Random"] = {
+        "rewards": random_rewards,
+        "profits": random_profits,
+        "infos": random_infos,
+    }
     print_stats("Random", random_rewards, random_profits)
 
-    print("\n" + "=" * 50)
-    print("Training A2C Model (Optimized Hyperparameters)")
-    print("=" * 50)
-    a2c_model = train_a2c(train_env, config.seed, config.total_timesteps)
-    models["A2C"] = a2c_model
-    a2c_rewards, a2c_profits = evaluate_model(
-        a2c_model,
-        test_env,
-        config.num_eval_episodes,
-        config.seed,
-    )
-    results["A2C"] = {"rewards": a2c_rewards, "profits": a2c_profits}
-    print_stats("A2C", a2c_rewards, a2c_profits)
-
-    print("\n" + "=" * 50)
-    print("Training PPO Model (Optimized Hyperparameters)")
-    print("=" * 50)
-    ppo_model = train_ppo(train_env, config.seed, config.total_timesteps)
-    models["PPO"] = ppo_model
-    ppo_rewards, ppo_profits = evaluate_model(
-        ppo_model,
-        test_env,
-        config.num_eval_episodes,
-        config.seed,
-    )
-    results["PPO"] = {"rewards": ppo_rewards, "profits": ppo_profits}
-    print_stats("PPO", ppo_rewards, ppo_profits)
+    for algo in _resolve_algorithms(config.env_type, config.algorithms):
+        print("\n" + "=" * 50)
+        print(f"Training {algo} Model")
+        print("=" * 50)
+        trainer = _TRAINERS[algo]
+        model = trainer(train_env, config.seed, config.total_timesteps)
+        models[algo] = model
+        rewards, profits, infos = evaluate_model(
+            model,
+            test_env,
+            config.num_eval_episodes,
+            config.seed,
+        )
+        results[algo] = {"rewards": rewards, "profits": profits, "infos": infos}
+        print_stats(algo, rewards, profits)
 
     return ExperimentArtifacts(
         df=df,
@@ -155,4 +252,5 @@ def run_experiment(config: ExperimentConfig) -> ExperimentArtifacts:
         results=results,
         train_frame_bound=train_frame_bound,
         test_frame_bound=test_frame_bound,
+        env_type=config.env_type,
     )
