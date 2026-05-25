@@ -1,0 +1,10 @@
+gym-anytrading
+gymnasium
+matplotlib
+numpy
+openpyxl
+pandas
+seaborn
+stable-baselines3
+torch
+tqdm

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-stock"
+version = "0.1.0"
+description = "Structured reinforcement-learning trading experiment for Shanghai Index data."
+requires-python = ">=3.10"
+dependencies = [
+    "gym-anytrading",
+    "gymnasium",
+    "matplotlib",
+    "numpy",
+    "openpyxl",
+    "pandas",
+    "stable-baselines3",
+    "torch",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
