@@ -12,6 +12,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+DEFAULT_ALGOS = {
+    "t1": "A2C,PPO",
+    "position": "PPO,SAC",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train RL trading agents for Shanghai Index data.")
     parser.add_argument("--data-path", type=Path, default=Path("output.xlsx"))
@@ -24,7 +30,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-plots", action="store_true")
     parser.add_argument("--no-save-models", action="store_true")
     parser.add_argument("--skip-trade-plots", action="store_true")
+
+    parser.add_argument(
+        "--env-type",
+        choices=["t1", "position"],
+        default="t1",
+        help="t1 = legacy discrete env, position = continuous risk-managed env.",
+    )
+    parser.add_argument(
+        "--algorithms",
+        type=str,
+        default=None,
+        help="Comma-separated list of algorithms (A2C,PPO,SAC,TD3). Defaults depend on --env-type.",
+    )
+    parser.add_argument("--initial-cash", type=float, default=1_000_000.0)
+    parser.add_argument("--max-position", type=float, default=1.0)
+    parser.add_argument("--stop-loss-pct", type=float, default=0.05)
+    parser.add_argument("--max-drawdown-pct", type=float, default=0.15)
+    parser.add_argument("--trade-fee-rate", type=float, default=0.001)
+    parser.add_argument("--vol-target", type=float, default=0.02)
+    parser.add_argument("--drawdown-coeff", type=float, default=0.5)
+    parser.add_argument("--turnover-coeff", type=float, default=0.1)
+    parser.add_argument("--sharpe-coeff", type=float, default=1.0)
+    parser.add_argument("--dsr-eta", type=float, default=0.01)
     return parser.parse_args()
+
+
+def _resolve_algos(env_type: str, raw: str | None) -> tuple[str, ...]:
+    text = raw if raw is not None else DEFAULT_ALGOS[env_type]
+    return tuple(name.strip().upper() for name in text.split(",") if name.strip())
 
 
 def main() -> None:
@@ -44,6 +78,7 @@ def main() -> None:
 
     configure_matplotlib()
 
+    algorithms = _resolve_algos(args.env_type, args.algorithms)
     config = ExperimentConfig(
         data_path=args.data_path,
         test_start_date=args.test_start_date,
@@ -54,6 +89,18 @@ def main() -> None:
         output_dir=args.output_dir,
         show_plots=args.show_plots,
         save_models=not args.no_save_models,
+        env_type=args.env_type,
+        algorithms=algorithms,
+        initial_cash=args.initial_cash,
+        max_position=args.max_position,
+        stop_loss_pct=args.stop_loss_pct,
+        max_drawdown_pct=args.max_drawdown_pct,
+        trade_fee_rate=args.trade_fee_rate,
+        vol_target=args.vol_target,
+        drawdown_coeff=args.drawdown_coeff,
+        turnover_coeff=args.turnover_coeff,
+        sharpe_coeff=args.sharpe_coeff,
+        dsr_eta=args.dsr_eta,
     )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 

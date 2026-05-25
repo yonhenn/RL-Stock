@@ -21,3 +21,14 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "unit: fast in-memory unit tests",
+    "integration: integration tests that touch real data files",
+]
+filterwarnings = [
+    "ignore:.*invalid value encountered in divide.*:RuntimeWarning",
+]
