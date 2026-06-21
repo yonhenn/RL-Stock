@@ -34,3 +34,18 @@ class ExperimentConfig:
     turnover_coeff: float = 0.1
     sharpe_coeff: float = 1.0
     dsr_eta: float = 0.01
+    # Upgrade the state space with trend-aware features (SMA slope, BB width,
+    # ADX, MACD golden/death cross, trend score, regime). Only consumed by
+    # env_type == "position".
+    use_trend_features: bool = False
+    # Trend-aware position management (residual policy): the explicit trend
+    # judgment anchors a base position and the agent tilts around it, with
+    # optional regime-aware counter-trend caps and an alignment reward.
+    use_trend_prior: bool = False
+    trend_base_exposure: float = 0.8
+    residual_band: float = 0.5
+    regime_risk_scaling: bool = False
+    counter_trend_cap: float = 0.2
+    trend_align_coeff: float = 0.0
+    adx_trend_threshold: float = 20.0
+    adx_strong_threshold: float = 40.0

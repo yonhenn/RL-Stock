@@ -16,14 +16,25 @@ import numpy as np
 from gymnasium import spaces
 
 from rl_stock.indicators import (
+    compute_adx,
     compute_bollinger_bands,
+    compute_bollinger_bandwidth,
     compute_macd,
+    compute_macd_cross,
     compute_rsi,
+    compute_sma_slope,
     historical_moving_average,
 )
 from rl_stock.risk import EPS, IncrementalSharpe, compute_atr
+from rl_stock.trend import (
+    TrendRegime,
+    classify_trend_regime,
+    compute_trend_score,
+    regime_to_base_position,
+)
 
 N_TECH_FEATURES = 13
+N_TREND_FEATURES = 6
 N_PORTFOLIO_FEATURES = 6
 
 
@@ -41,6 +52,18 @@ class RiskConfig:
     turnover_coeff: float = 0.1
     sharpe_coeff: float = 1.0
     dsr_eta: float = 0.01
+    use_trend_features: bool = False
+    # Trend-aware position management (residual policy). The explicit trend
+    # judgment anchors a base position; the agent learns a bounded tilt around
+    # it, and a strongly trending regime can cap counter-trend exposure.
+    use_trend_prior: bool = False
+    trend_base_exposure: float = 0.8
+    residual_band: float = 0.5
+    regime_risk_scaling: bool = False
+    counter_trend_cap: float = 0.2
+    trend_align_coeff: float = 0.0
+    adx_trend_threshold: float = 20.0
+    adx_strong_threshold: float = 40.0
 
 
 class PositionMgmtEnv(gymnasium.Env):
@@ -77,7 +100,10 @@ class PositionMgmtEnv(gymnasium.Env):
         self.prices, self.signal_features, self.atr = self._process_data()
         self._base_atr = float(np.mean(self.atr[: self.window_size])) or EPS
 
-        n_features = N_TECH_FEATURES + N_PORTFOLIO_FEATURES
+        n_tech = N_TECH_FEATURES + (
+            N_TREND_FEATURES if self.risk.use_trend_features else 0
+        )
+        n_features = n_tech + N_PORTFOLIO_FEATURES
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(1,), dtype=np.float32
         )
@@ -108,6 +134,31 @@ class PositionMgmtEnv(gymnasium.Env):
         bb_upper, _, bb_lower = compute_bollinger_bands(full_close, 20)
         atr_full = compute_atr(full_high, full_low, full_close, 14)
 
+        if self.risk.use_trend_features:
+            sma_slope_full = compute_sma_slope(full_close, period=20, slope_window=5)
+            bb_bandwidth_full = compute_bollinger_bandwidth(full_close, period=20)
+            adx_full = compute_adx(full_high, full_low, full_close, period=14)
+            macd_cross_full = compute_macd_cross(full_close)
+
+        # Explicit trend judgment, computed unconditionally so the residual
+        # policy, regime caps, and alignment reward can index it cheaply.
+        trend_score_full = compute_trend_score(
+            full_high,
+            full_low,
+            full_close,
+            adx_strong=self.risk.adx_strong_threshold,
+        )
+        regime_full = classify_trend_regime(
+            full_high,
+            full_low,
+            full_close,
+            adx_trend=self.risk.adx_trend_threshold,
+            adx_strong=self.risk.adx_strong_threshold,
+        )
+        trend_base_full = regime_to_base_position(
+            regime_full, self.risk.trend_base_exposure
+        )
+
         start = self.frame_bound[0] - self.window_size
         end = self.frame_bound[1]
 
@@ -124,6 +175,11 @@ class PositionMgmtEnv(gymnasium.Env):
         bb_upper = bb_upper[start:end]
         bb_lower = bb_lower[start:end]
         atr_window = atr_full[start:end]
+
+        # Per-tick trend judgment aligned to ``self.prices`` (causal, no look-ahead).
+        self._regime = regime_full[start:end].astype(np.float32)
+        self._trend_base = trend_base_full[start:end].astype(np.float32)
+        self._trend_score = trend_score_full[start:end].astype(np.float32)
 
         eps = EPS
         pct_change = np.insert(np.diff(close) / np.maximum(close[:-1], eps) * 100, 0, 0)
@@ -143,23 +199,41 @@ class PositionMgmtEnv(gymnasium.Env):
         momentum_5 = np.zeros(len(close))
         momentum_5[5:] = (close[5:] - close[:-5]) / np.maximum(close[:-5], eps) * 100
 
-        signal_features = np.column_stack(
-            (
-                pct_change,
-                ma5_ratio,
-                ma10_ratio,
-                ma20_ratio,
-                ma60_ratio,
-                ma5_10_cross,
-                ma10_20_cross,
-                rsi_norm,
-                macd_norm,
-                bb_position / 100,
-                amplitude,
-                body,
-                momentum_5,
+        feature_columns = [
+            pct_change,
+            ma5_ratio,
+            ma10_ratio,
+            ma20_ratio,
+            ma60_ratio,
+            ma5_10_cross,
+            ma10_20_cross,
+            rsi_norm,
+            macd_norm,
+            bb_position / 100,
+            amplitude,
+            body,
+            momentum_5,
+        ]
+
+        if self.risk.use_trend_features:
+            sma_slope_norm = sma_slope_full[start:end] * 100.0  # percent per day
+            bb_bandwidth_col = bb_bandwidth_full[start:end]  # ratio, already O(0.1)
+            adx_norm = adx_full[start:end] / 100.0  # -> [0, 1]
+            macd_cross_col = macd_cross_full[start:end]  # {-1, 0, +1}
+            trend_score_col = self._trend_score  # signed strength [-1, 1]
+            regime_norm = self._regime / 2.0  # {-1, -.5, 0, .5, 1}
+            feature_columns.extend(
+                [
+                    sma_slope_norm,
+                    bb_bandwidth_col,
+                    adx_norm,
+                    macd_cross_col,
+                    trend_score_col,
+                    regime_norm,
+                ]
             )
-        )
+
+        signal_features = np.column_stack(feature_columns)
         signal_features = np.nan_to_num(signal_features, nan=0.0, posinf=10.0, neginf=-10.0)
         signal_features = np.clip(signal_features, -100, 100)
         return (
@@ -250,6 +324,9 @@ class PositionMgmtEnv(gymnasium.Env):
             "trade_returns": list(self._trade_returns),
             "returns": list(self._returns),
             "dd_locked": self._dd_locked,
+            "regime": float(self._regime[self._current_tick]),
+            "trend_score": float(self._trend_score[self._current_tick]),
+            "trend_base": float(self._trend_base[self._current_tick]),
         }
 
     def _volatility_scaled_target(self, raw_target: float) -> float:
@@ -263,13 +340,42 @@ class PositionMgmtEnv(gymnasium.Env):
         scaled = raw_target * scale
         return float(np.clip(scaled, -self.risk.max_position, self.risk.max_position))
 
+    def _resolve_target(self, raw_action: float) -> float:
+        """Translate the raw agent action into a target position ratio.
+
+        With ``use_trend_prior`` the explicit trend judgment supplies a base
+        position (the trend-following anchor) and the action becomes a bounded
+        *tilt* around it (residual policy); otherwise the action is the target
+        directly. The result is volatility-scaled and, when ``regime_risk_scaling``
+        is on, clamped by regime-aware counter-trend caps.
+        """
+        raw = float(np.clip(raw_action, -1.0, 1.0))
+        if self.risk.use_trend_prior:
+            prior = float(self._trend_base[self._current_tick])
+            combined = prior + raw * self.risk.residual_band
+        else:
+            combined = raw
+        target = self._volatility_scaled_target(combined)
+        if self.risk.regime_risk_scaling:
+            target = self._apply_regime_caps(target)
+        return target
+
+    def _apply_regime_caps(self, target: float) -> float:
+        """Forbid large counter-trend exposure inside a strongly trending regime."""
+        regime = float(self._regime[self._current_tick])
+        cap = self.risk.counter_trend_cap
+        if regime <= float(TrendRegime.STRONG_DOWN):
+            target = min(target, cap)
+        elif regime >= float(TrendRegime.STRONG_UP):
+            target = max(target, -cap)
+        return float(target)
+
     def step(self, action):
         if self._terminated or self._truncated:
             raise RuntimeError("step() called on a finished episode; call reset() first.")
 
         raw_action = float(np.asarray(action).flatten()[0])
-        raw_action = float(np.clip(raw_action, -1.0, 1.0))
-        target_position = self._volatility_scaled_target(raw_action)
+        target_position = self._resolve_target(raw_action)
 
         prev_position = self._position_ratio
         current_price = float(self.prices[self._current_tick])
@@ -338,7 +444,9 @@ class PositionMgmtEnv(gymnasium.Env):
         if flatten and abs(prev_position) > EPS:
             self._trade_returns.append(unrealized_pnl)
 
-        reward = self._calculate_reward(net_return, delta_position)
+        reward = self._calculate_reward(
+            net_return, delta_position, float(self._trend_score[prev_tick])
+        )
 
         if self._equity <= 0:
             self._terminated = True
@@ -350,16 +458,27 @@ class PositionMgmtEnv(gymnasium.Env):
         info["stop_triggered"] = stop_triggered
         return observation, reward, self._terminated, self._truncated, info
 
-    def _calculate_reward(self, net_return: float, delta_position: float) -> float:
+    def _calculate_reward(
+        self, net_return: float, delta_position: float, trend_score: float
+    ) -> float:
         sharpe_component = self._dsr.update(net_return)
         drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
         drawdown_penalty = -abs(min(drawdown, 0.0))
         turnover_penalty = -abs(delta_position)
+        # Optional: reward holding a position aligned with the trend judgment
+        # (positive when long in an uptrend / short in a downtrend). Off by
+        # default (coeff 0) to keep the objective return/Sharpe-driven.
+        align_bonus = (
+            self.risk.trend_align_coeff
+            * float(np.sign(self._position_ratio))
+            * trend_score
+        )
 
         reward = (
             sharpe_component * self.risk.sharpe_coeff
             + drawdown_penalty * self.risk.drawdown_coeff
             + turnover_penalty * self.risk.turnover_coeff
+            + align_bonus
         )
         if not np.isfinite(reward):
             return 0.0

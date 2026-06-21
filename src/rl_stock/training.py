@@ -159,6 +159,15 @@ def _build_envs(config: ExperimentConfig, df, train_bound, test_bound):
             turnover_coeff=config.turnover_coeff,
             sharpe_coeff=config.sharpe_coeff,
             dsr_eta=config.dsr_eta,
+            use_trend_features=config.use_trend_features,
+            use_trend_prior=config.use_trend_prior,
+            trend_base_exposure=config.trend_base_exposure,
+            residual_band=config.residual_band,
+            regime_risk_scaling=config.regime_risk_scaling,
+            counter_trend_cap=config.counter_trend_cap,
+            trend_align_coeff=config.trend_align_coeff,
+            adx_trend_threshold=config.adx_trend_threshold,
+            adx_strong_threshold=config.adx_strong_threshold,
         )
         train_env = PositionMgmtEnv(
             df=df,

@@ -14,7 +14,9 @@ if str(SRC) not in sys.path:
 
 DEFAULT_ALGOS = {
     "t1": "A2C,PPO",
-    "position": "PPO,SAC",
+    # SAC first: off-policy, entropy-regularized actor-critic is the natural fit
+    # for continuous position sizing (sample-efficient exploration of sizes).
+    "position": "SAC,PPO",
 }
 
 
@@ -53,6 +55,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turnover-coeff", type=float, default=0.1)
     parser.add_argument("--sharpe-coeff", type=float, default=1.0)
     parser.add_argument("--dsr-eta", type=float, default=0.01)
+    parser.add_argument(
+        "--use-trend-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add trend-aware state features (SMA slope, BB width, ADX, MACD cross, "
+        "trend score, regime). Only affects --env-type position.",
+    )
+    parser.add_argument(
+        "--use-trend-prior",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Residual policy: anchor the position to a trend-following base from the "
+        "regime judgment and let the agent tilt around it. --env-type position only.",
+    )
+    parser.add_argument("--trend-base-exposure", type=float, default=0.8)
+    parser.add_argument("--residual-band", type=float, default=0.5)
+    parser.add_argument(
+        "--regime-risk-scaling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Cap counter-trend exposure inside a strongly trending regime.",
+    )
+    parser.add_argument("--counter-trend-cap", type=float, default=0.2)
+    parser.add_argument("--trend-align-coeff", type=float, default=0.0)
+    parser.add_argument("--adx-trend-threshold", type=float, default=20.0)
+    parser.add_argument("--adx-strong-threshold", type=float, default=40.0)
     return parser.parse_args()
 
 
@@ -101,6 +129,15 @@ def main() -> None:
         turnover_coeff=args.turnover_coeff,
         sharpe_coeff=args.sharpe_coeff,
         dsr_eta=args.dsr_eta,
+        use_trend_features=args.use_trend_features,
+        use_trend_prior=args.use_trend_prior,
+        trend_base_exposure=args.trend_base_exposure,
+        residual_band=args.residual_band,
+        regime_risk_scaling=args.regime_risk_scaling,
+        counter_trend_cap=args.counter_trend_cap,
+        trend_align_coeff=args.trend_align_coeff,
+        adx_trend_threshold=args.adx_trend_threshold,
+        adx_strong_threshold=args.adx_strong_threshold,
     )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
