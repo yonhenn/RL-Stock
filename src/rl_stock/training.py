@@ -1,4 +1,4 @@
-"""Training orchestration for the Shanghai Index experiment."""
+"""Training orchestration for the NASDAQ-100 index experiment."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
-from stable_baselines3 import A2C, PPO, SAC, TD3
+from stable_baselines3 import A2C, DDPG, PPO, SAC, TD3
+from stable_baselines3.common.noise import NormalActionNoise
 
 from rl_stock.config import ExperimentConfig
 from rl_stock.data import load_market_data, split_frame_bounds
-from rl_stock.envs import ShanghaiIndexEnvT1
+from rl_stock.envs import IndexTradingEnvT1
 from rl_stock.envs_v2 import PositionMgmtEnv, RiskConfig
 from rl_stock.evaluation import ProgressBarCallback, evaluate_model, print_stats
 
@@ -102,14 +103,18 @@ def train_sac(train_env, seed: int, total_timesteps: int):
     return model
 
 
+def _normal_action_noise(train_env) -> NormalActionNoise:
+    """Zero-mean Gaussian exploration noise matched to the action space.
+
+    Shared by the deterministic-policy algorithms (TD3, DDPG), which -- unlike
+    SAC's stochastic policy -- need injected noise to explore.
+    """
+    action_dim = int(np.prod(train_env.action_space.shape))
+    return NormalActionNoise(mean=np.zeros(action_dim), sigma=0.1 * np.ones(action_dim))
+
+
 def train_td3(train_env, seed: int, total_timesteps: int):
     """Train TD3 for comparison against SAC on continuous actions."""
-    action_dim = int(np.prod(train_env.action_space.shape))
-    from stable_baselines3.common.noise import NormalActionNoise
-
-    action_noise = NormalActionNoise(
-        mean=np.zeros(action_dim), sigma=0.1 * np.ones(action_dim)
-    )
     model = TD3(
         "MlpPolicy",
         train_env,
@@ -120,7 +125,33 @@ def train_td3(train_env, seed: int, total_timesteps: int):
         batch_size=256,
         tau=0.005,
         gamma=0.99,
-        action_noise=action_noise,
+        action_noise=_normal_action_noise(train_env),
+        policy_kwargs={"net_arch": [256, 256]},
+    )
+    model.learn(total_timesteps=total_timesteps, callback=ProgressBarCallback())
+    return model
+
+
+def train_ddpg(train_env, seed: int, total_timesteps: int):
+    """Train DDPG -- deterministic off-policy actor-critic.
+
+    The literature's strongest single-asset / single-index performer (e.g. FinRL
+    on the NASDAQ index): a decisive deterministic policy that commits to
+    trends. Shares TD3's hyperparameters so the head-to-head isolates the
+    algorithmic difference -- TD3 adds twin critics plus delayed, smoothed
+    policy updates on top of DDPG.
+    """
+    model = DDPG(
+        "MlpPolicy",
+        train_env,
+        verbose=0,
+        seed=seed,
+        learning_rate=3e-4,
+        buffer_size=100_000,
+        batch_size=256,
+        tau=0.005,
+        gamma=0.99,
+        action_noise=_normal_action_noise(train_env),
         policy_kwargs={"net_arch": [256, 256]},
     )
     model.learn(total_timesteps=total_timesteps, callback=ProgressBarCallback())
@@ -132,17 +163,18 @@ _TRAINERS: dict[str, TrainFn] = {
     "PPO": train_ppo,
     "SAC": train_sac,
     "TD3": train_td3,
+    "DDPG": train_ddpg,
 }
 
-_CONTINUOUS_ONLY = {"SAC", "TD3"}
+_CONTINUOUS_ONLY = {"SAC", "TD3", "DDPG"}
 
 
 def _build_envs(config: ExperimentConfig, df, train_bound, test_bound):
     if config.env_type == "t1":
-        train_env = ShanghaiIndexEnvT1(
+        train_env = IndexTradingEnvT1(
             df=df, window_size=config.window_size, frame_bound=train_bound
         )
-        test_env = ShanghaiIndexEnvT1(
+        test_env = IndexTradingEnvT1(
             df=df, window_size=config.window_size, frame_bound=test_bound
         )
         return train_env, test_env
@@ -168,6 +200,10 @@ def _build_envs(config: ExperimentConfig, df, train_bound, test_bound):
             trend_align_coeff=config.trend_align_coeff,
             adx_trend_threshold=config.adx_trend_threshold,
             adx_strong_threshold=config.adx_strong_threshold,
+            use_turbulence_gate=config.use_turbulence_gate,
+            turbulence_lookback=config.turbulence_lookback,
+            turbulence_threshold=config.turbulence_threshold,
+            turbulence_exposure_cap=config.turbulence_exposure_cap,
         )
         train_env = PositionMgmtEnv(
             df=df,

@@ -17,7 +17,7 @@ RENAME_COLUMNS = {
 
 
 def load_market_data(data_path: str | Path) -> pd.DataFrame:
-    """Load and normalize the Shanghai Index Excel dataset."""
+    """Load and normalize the NASDAQ-100 index Excel dataset."""
     data_path = Path(data_path)
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
