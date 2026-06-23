@@ -1,4 +1,4 @@
-"""Trading environments for Shanghai Index reinforcement learning."""
+"""Trading environments for index reinforcement learning (NASDAQ-100)."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from rl_stock.indicators import (
 )
 
 
-class ShanghaiIndexEnv(StocksEnv):
-    """Enhanced Shanghai Index environment from the original notebook."""
+class IndexTradingEnv(StocksEnv):
+    """Enhanced index trading environment from the original notebook."""
 
     def __init__(self, df, window_size, frame_bound, render_mode=None):
         super().__init__(df, window_size, frame_bound, render_mode)
@@ -119,8 +119,13 @@ class ShanghaiIndexEnv(StocksEnv):
         return step_reward
 
 
-class ShanghaiIndexEnvT1(StocksEnv):
-    """T+1 compliant Shanghai Index trading environment."""
+class IndexTradingEnvT1(StocksEnv):
+    """T+1 constrained discrete index trading environment.
+
+    Note: the T+1 hold-one-day rule is a China A-share constraint and does not
+    apply to NASDAQ; kept available for comparison but ``position`` is the
+    appropriate env for US markets.
+    """
 
     def __init__(self, df, window_size, frame_bound, render_mode=None):
         self.frame_bound = frame_bound
@@ -330,7 +335,7 @@ class ShanghaiIndexEnvT1(StocksEnv):
             fontsize=14,
         )
         ax.set_xlabel("Trading Day")
-        ax.set_ylabel("Shanghai Index")
+        ax.set_ylabel("NASDAQ-100")
         ax.legend(loc="upper left")
         ax.grid(True, alpha=0.3)
         plt.tight_layout()

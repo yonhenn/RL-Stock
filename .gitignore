@@ -5,3 +5,6 @@ __pycache__/
 outputs/
 .DS_Store
 output.xlsx
+*.bak
+# Generated analysis report (regenerate via scripts/generate_regime_performance.py)
+regime_performance.html

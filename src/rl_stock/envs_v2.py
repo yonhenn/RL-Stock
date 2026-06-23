@@ -2,9 +2,10 @@
 
 ``PositionMgmtEnv`` simulates a portfolio account where the agent decides a
 *target position ratio* in [-1, 1] each step. The environment translates that
-target into trades, books transaction costs, enforces stop-loss / drawdown
-hard limits, and rewards the agent with a Differential Sharpe Ratio plus
-penalties for drawdown and turnover.
+target into trades, books transaction costs, optionally enforces stop-loss /
+drawdown hard limits (both off by default, so risk is reward-driven), and
+rewards the agent with a Differential Sharpe Ratio plus penalties for drawdown
+and turnover.
 """
 
 from __future__ import annotations
@@ -16,14 +17,26 @@ import numpy as np
 from gymnasium import spaces
 
 from rl_stock.indicators import (
+    compute_adx,
     compute_bollinger_bands,
+    compute_bollinger_bandwidth,
     compute_macd,
+    compute_macd_cross,
     compute_rsi,
+    compute_sma_slope,
     historical_moving_average,
 )
-from rl_stock.risk import EPS, IncrementalSharpe, compute_atr
+from rl_stock.risk import EPS, IncrementalSharpe, compute_atr, compute_turbulence
+from rl_stock.trend import (
+    TrendRegime,
+    classify_trend_regime,
+    compute_trend_score,
+    regime_to_base_position,
+)
 
 N_TECH_FEATURES = 13
+N_TREND_FEATURES = 6
+N_TURBULENCE_FEATURES = 1
 N_PORTFOLIO_FEATURES = 6
 
 
@@ -33,14 +46,38 @@ class RiskConfig:
 
     initial_cash: float = 1_000_000.0
     max_position: float = 1.0
-    stop_loss_pct: float = 0.05
-    max_drawdown_pct: float = 0.15
+    # Hard risk rails, both opt-in. Per-trade stop (0.05 = flatten at -5% of
+    # entry) and equity drawdown lock (0.15 = de-risk past -15% off the peak).
+    # A non-positive value disables that rail; the default 0.0 disables both so
+    # the agent manages risk purely through the reward (DSR + penalties).
+    stop_loss_pct: float = 0.0
+    max_drawdown_pct: float = 0.0
     trade_fee_rate: float = 0.001
     vol_target: float = 0.02
     drawdown_coeff: float = 0.5
     turnover_coeff: float = 0.1
     sharpe_coeff: float = 1.0
     dsr_eta: float = 0.01
+    use_trend_features: bool = False
+    # Trend-aware position management (residual policy). The explicit trend
+    # judgment anchors a base position; the agent learns a bounded tilt around
+    # it, and a strongly trending regime can cap counter-trend exposure.
+    use_trend_prior: bool = False
+    trend_base_exposure: float = 0.8
+    residual_band: float = 0.5
+    regime_risk_scaling: bool = False
+    counter_trend_cap: float = 0.2
+    trend_align_coeff: float = 0.0
+    adx_trend_threshold: float = 20.0
+    adx_strong_threshold: float = 40.0
+    # Market-level turbulence circuit breaker (Kritzman-Li, single-asset proxy).
+    # When on, a turbulence state feature is added and exposure is capped to
+    # ``turbulence_exposure_cap`` (0 = flat) on days whose squared return
+    # z-score exceeds ``turbulence_threshold`` -- FinRL's crash risk-off rule.
+    use_turbulence_gate: bool = False
+    turbulence_lookback: int = 252
+    turbulence_threshold: float = 9.0  # z**2; 9.0 == a 3-sigma daily move
+    turbulence_exposure_cap: float = 0.0
 
 
 class PositionMgmtEnv(gymnasium.Env):
@@ -77,7 +114,12 @@ class PositionMgmtEnv(gymnasium.Env):
         self.prices, self.signal_features, self.atr = self._process_data()
         self._base_atr = float(np.mean(self.atr[: self.window_size])) or EPS
 
-        n_features = N_TECH_FEATURES + N_PORTFOLIO_FEATURES
+        n_tech = (
+            N_TECH_FEATURES
+            + (N_TREND_FEATURES if self.risk.use_trend_features else 0)
+            + (N_TURBULENCE_FEATURES if self.risk.use_turbulence_gate else 0)
+        )
+        n_features = n_tech + N_PORTFOLIO_FEATURES
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(1,), dtype=np.float32
         )
@@ -108,6 +150,31 @@ class PositionMgmtEnv(gymnasium.Env):
         bb_upper, _, bb_lower = compute_bollinger_bands(full_close, 20)
         atr_full = compute_atr(full_high, full_low, full_close, 14)
 
+        if self.risk.use_trend_features:
+            sma_slope_full = compute_sma_slope(full_close, period=20, slope_window=5)
+            bb_bandwidth_full = compute_bollinger_bandwidth(full_close, period=20)
+            adx_full = compute_adx(full_high, full_low, full_close, period=14)
+            macd_cross_full = compute_macd_cross(full_close)
+
+        # Explicit trend judgment, computed unconditionally so the residual
+        # policy, regime caps, and alignment reward can index it cheaply.
+        trend_score_full = compute_trend_score(
+            full_high,
+            full_low,
+            full_close,
+            adx_strong=self.risk.adx_strong_threshold,
+        )
+        regime_full = classify_trend_regime(
+            full_high,
+            full_low,
+            full_close,
+            adx_trend=self.risk.adx_trend_threshold,
+            adx_strong=self.risk.adx_strong_threshold,
+        )
+        trend_base_full = regime_to_base_position(
+            regime_full, self.risk.trend_base_exposure
+        )
+
         start = self.frame_bound[0] - self.window_size
         end = self.frame_bound[1]
 
@@ -124,6 +191,22 @@ class PositionMgmtEnv(gymnasium.Env):
         bb_upper = bb_upper[start:end]
         bb_lower = bb_lower[start:end]
         atr_window = atr_full[start:end]
+
+        # Per-tick trend judgment aligned to ``self.prices`` (causal, no look-ahead).
+        self._regime = regime_full[start:end].astype(np.float32)
+        self._trend_base = trend_base_full[start:end].astype(np.float32)
+        self._trend_score = trend_score_full[start:end].astype(np.float32)
+
+        # Market-level turbulence aligned to ``self.prices`` (causal). Computed on
+        # the full series so the test frame can draw on prior history; only the
+        # gate consumes it, so skip the work when it is off.
+        if self.risk.use_turbulence_gate:
+            turbulence_full = compute_turbulence(
+                full_close, lookback=self.risk.turbulence_lookback
+            )
+            self._turbulence = turbulence_full[start:end].astype(np.float32)
+        else:
+            self._turbulence = np.zeros(end - start, dtype=np.float32)
 
         eps = EPS
         pct_change = np.insert(np.diff(close) / np.maximum(close[:-1], eps) * 100, 0, 0)
@@ -143,23 +226,49 @@ class PositionMgmtEnv(gymnasium.Env):
         momentum_5 = np.zeros(len(close))
         momentum_5[5:] = (close[5:] - close[:-5]) / np.maximum(close[:-5], eps) * 100
 
-        signal_features = np.column_stack(
-            (
-                pct_change,
-                ma5_ratio,
-                ma10_ratio,
-                ma20_ratio,
-                ma60_ratio,
-                ma5_10_cross,
-                ma10_20_cross,
-                rsi_norm,
-                macd_norm,
-                bb_position / 100,
-                amplitude,
-                body,
-                momentum_5,
+        feature_columns = [
+            pct_change,
+            ma5_ratio,
+            ma10_ratio,
+            ma20_ratio,
+            ma60_ratio,
+            ma5_10_cross,
+            ma10_20_cross,
+            rsi_norm,
+            macd_norm,
+            bb_position / 100,
+            amplitude,
+            body,
+            momentum_5,
+        ]
+
+        if self.risk.use_trend_features:
+            sma_slope_norm = sma_slope_full[start:end] * 100.0  # percent per day
+            bb_bandwidth_col = bb_bandwidth_full[start:end]  # ratio, already O(0.1)
+            adx_norm = adx_full[start:end] / 100.0  # -> [0, 1]
+            macd_cross_col = macd_cross_full[start:end]  # {-1, 0, +1}
+            trend_score_col = self._trend_score  # signed strength [-1, 1]
+            regime_norm = self._regime / 2.0  # {-1, -.5, 0, .5, 1}
+            feature_columns.extend(
+                [
+                    sma_slope_norm,
+                    bb_bandwidth_col,
+                    adx_norm,
+                    macd_cross_col,
+                    trend_score_col,
+                    regime_norm,
+                ]
             )
-        )
+
+        if self.risk.use_turbulence_gate:
+            # Bounded, smooth "how turbulent" signal: ~0 when calm, -> 1 at/above
+            # the gate threshold. tanh keeps it O(1) like the other features.
+            turbulence_norm = np.tanh(
+                self._turbulence / max(self.risk.turbulence_threshold, EPS)
+            )
+            feature_columns.append(turbulence_norm)
+
+        signal_features = np.column_stack(feature_columns)
         signal_features = np.nan_to_num(signal_features, nan=0.0, posinf=10.0, neginf=-10.0)
         signal_features = np.clip(signal_features, -100, 100)
         return (
@@ -207,11 +316,12 @@ class PositionMgmtEnv(gymnasium.Env):
         atr_now = float(self.atr[self._current_tick])
         volatility = atr_now / max(current_price, EPS)
         holding_norm = np.tanh(self._holding_days / 30.0)
-        distance_to_stop = (
-            1.0 - abs(unrealized_pnl) / max(self.risk.stop_loss_pct, EPS)
-            if abs(self._position_ratio) > EPS
-            else 1.0
-        )
+        # Neutral (1.0 = far from any stop) when flat or when the hard stop is
+        # disabled (stop_loss_pct <= 0); otherwise how close to the stop we are.
+        if abs(self._position_ratio) > EPS and self.risk.stop_loss_pct > 0:
+            distance_to_stop = 1.0 - abs(unrealized_pnl) / self.risk.stop_loss_pct
+        else:
+            distance_to_stop = 1.0
 
         return np.array(
             [
@@ -250,6 +360,10 @@ class PositionMgmtEnv(gymnasium.Env):
             "trade_returns": list(self._trade_returns),
             "returns": list(self._returns),
             "dd_locked": self._dd_locked,
+            "regime": float(self._regime[self._current_tick]),
+            "trend_score": float(self._trend_score[self._current_tick]),
+            "trend_base": float(self._trend_base[self._current_tick]),
+            "turbulence": float(self._turbulence[self._current_tick]),
         }
 
     def _volatility_scaled_target(self, raw_target: float) -> float:
@@ -263,13 +377,64 @@ class PositionMgmtEnv(gymnasium.Env):
         scaled = raw_target * scale
         return float(np.clip(scaled, -self.risk.max_position, self.risk.max_position))
 
+    def _resolve_target(self, raw_action: float) -> float:
+        """Translate the raw agent action into a target position ratio.
+
+        With ``use_trend_prior`` the explicit trend judgment supplies a base
+        position (the trend-following anchor) and the action becomes a bounded
+        *tilt* around it (residual policy); otherwise the action is the target
+        directly. The result is volatility-scaled and, when ``regime_risk_scaling``
+        is on, clamped by regime-aware counter-trend caps.
+        """
+        raw = float(np.clip(raw_action, -1.0, 1.0))
+        if self.risk.use_trend_prior:
+            prior = float(self._trend_base[self._current_tick])
+            combined = prior + raw * self.risk.residual_band
+        else:
+            combined = raw
+        target = self._volatility_scaled_target(combined)
+        if self.risk.regime_risk_scaling:
+            target = self._apply_regime_caps(target)
+        if self.risk.use_turbulence_gate:
+            target = self._apply_turbulence_gate(target)
+        return target
+
+    def _apply_regime_caps(self, target: float) -> float:
+        """Forbid large counter-trend exposure inside a strongly trending regime."""
+        regime = float(self._regime[self._current_tick])
+        cap = self.risk.counter_trend_cap
+        if regime <= float(TrendRegime.STRONG_DOWN):
+            target = min(target, cap)
+        elif regime >= float(TrendRegime.STRONG_UP):
+            target = max(target, -cap)
+        return float(target)
+
+    def _is_turbulent(self) -> bool:
+        """Whether the current tick's turbulence exceeds the gate threshold."""
+        return bool(
+            self.risk.use_turbulence_gate
+            and self._turbulence[self._current_tick] > self.risk.turbulence_threshold
+        )
+
+    def _apply_turbulence_gate(self, target: float) -> float:
+        """Risk-off on turbulent days (FinRL's turbulence rule, single-asset).
+
+        When the latest move is an outlier (squared return z-score above the
+        threshold) the target is clamped in magnitude to ``turbulence_exposure_cap``
+        regardless of sign, so a market shock forces de-risking. ``cap == 0``
+        flattens the book outright.
+        """
+        if not self._is_turbulent():
+            return float(target)
+        cap = abs(self.risk.turbulence_exposure_cap)
+        return float(np.clip(target, -cap, cap))
+
     def step(self, action):
         if self._terminated or self._truncated:
             raise RuntimeError("step() called on a finished episode; call reset() first.")
 
         raw_action = float(np.asarray(action).flatten()[0])
-        raw_action = float(np.clip(raw_action, -1.0, 1.0))
-        target_position = self._volatility_scaled_target(raw_action)
+        target_position = self._resolve_target(raw_action)
 
         prev_position = self._position_ratio
         current_price = float(self.prices[self._current_tick])
@@ -280,10 +445,13 @@ class PositionMgmtEnv(gymnasium.Env):
                 (current_price - self._entry_price) / self._entry_price * np.sign(prev_position)
             )
 
-        # Hard risk constraints. Stop-loss flattens immediately; drawdown lock
-        # forbids new exposure but lets the agent reduce.
+        # Hard risk constraints, both opt-in. Stop-loss flattens immediately;
+        # the drawdown lock forbids new exposure but lets the agent reduce. A
+        # non-positive ``stop_loss_pct`` / ``max_drawdown_pct`` disables that
+        # rail entirely (the default: pure reward-driven risk control).
         stop_triggered = (
-            abs(prev_position) > EPS
+            self.risk.stop_loss_pct > 0
+            and abs(prev_position) > EPS
             and unrealized_pnl <= -self.risk.stop_loss_pct
         )
         if stop_triggered:
@@ -292,7 +460,7 @@ class PositionMgmtEnv(gymnasium.Env):
             self._stopped_out = True
 
         drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
-        if drawdown <= -self.risk.max_drawdown_pct:
+        if self.risk.max_drawdown_pct > 0 and drawdown <= -self.risk.max_drawdown_pct:
             self._dd_locked = True
         if self._dd_locked and abs(target_position) > abs(prev_position):
             target_position = prev_position * 0.5
@@ -338,7 +506,9 @@ class PositionMgmtEnv(gymnasium.Env):
         if flatten and abs(prev_position) > EPS:
             self._trade_returns.append(unrealized_pnl)
 
-        reward = self._calculate_reward(net_return, delta_position)
+        reward = self._calculate_reward(
+            net_return, delta_position, float(self._trend_score[prev_tick])
+        )
 
         if self._equity <= 0:
             self._terminated = True
@@ -348,18 +518,33 @@ class PositionMgmtEnv(gymnasium.Env):
         info["prev_tick"] = prev_tick
         info["delta_position"] = delta_position
         info["stop_triggered"] = stop_triggered
+        info["turbulence_triggered"] = bool(
+            self.risk.use_turbulence_gate
+            and self._turbulence[prev_tick] > self.risk.turbulence_threshold
+        )
         return observation, reward, self._terminated, self._truncated, info
 
-    def _calculate_reward(self, net_return: float, delta_position: float) -> float:
+    def _calculate_reward(
+        self, net_return: float, delta_position: float, trend_score: float
+    ) -> float:
         sharpe_component = self._dsr.update(net_return)
         drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
         drawdown_penalty = -abs(min(drawdown, 0.0))
         turnover_penalty = -abs(delta_position)
+        # Optional: reward holding a position aligned with the trend judgment
+        # (positive when long in an uptrend / short in a downtrend). Off by
+        # default (coeff 0) to keep the objective return/Sharpe-driven.
+        align_bonus = (
+            self.risk.trend_align_coeff
+            * float(np.sign(self._position_ratio))
+            * trend_score
+        )
 
         reward = (
             sharpe_component * self.risk.sharpe_coeff
             + drawdown_penalty * self.risk.drawdown_coeff
             + turnover_penalty * self.risk.turnover_coeff
+            + align_bonus
         )
         if not np.isfinite(reward):
             return 0.0
