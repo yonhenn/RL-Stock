@@ -18,16 +18,20 @@ class ExperimentConfig:
     show_plots: bool = False
     save_models: bool = True
 
-    # Environment selection: "t1" (legacy discrete) or "position" (continuous risk-managed).
-    env_type: str = "t1"
-    # Algorithms to train. Valid: "A2C", "PPO", "SAC", "TD3".
-    algorithms: tuple[str, ...] = ("A2C", "PPO")
+    # Environment selection: "position" (continuous risk-managed) or "t1" (legacy
+    # discrete; T+1 is a China A-share rule and does not apply to NASDAQ).
+    env_type: str = "position"
+    # Algorithms to train. Valid: "A2C", "PPO", "SAC", "TD3", "DDPG".
+    algorithms: tuple[str, ...] = ("SAC", "PPO")
 
     # Risk-control knobs (only consumed by env_type == "position").
     initial_cash: float = 1_000_000.0
     max_position: float = 1.0
-    stop_loss_pct: float = 0.05
-    max_drawdown_pct: float = 0.15
+    # Hard risk rails, both opt-in (0.0 disables). Default off: the agent
+    # manages risk through the reward (DSR + drawdown/turnover penalties)
+    # rather than a forced stop-loss / drawdown lock.
+    stop_loss_pct: float = 0.0
+    max_drawdown_pct: float = 0.0
     trade_fee_rate: float = 0.001
     vol_target: float = 0.02
     drawdown_coeff: float = 0.5
@@ -49,3 +53,10 @@ class ExperimentConfig:
     trend_align_coeff: float = 0.0
     adx_trend_threshold: float = 20.0
     adx_strong_threshold: float = 40.0
+    # Turbulence circuit breaker (FinRL-style market-crash risk-off, single-asset
+    # proxy). Adds a turbulence state feature and caps exposure on outsized
+    # moves. Only consumed by env_type == "position".
+    use_turbulence_gate: bool = False
+    turbulence_lookback: int = 252
+    turbulence_threshold: float = 9.0
+    turbulence_exposure_cap: float = 0.0

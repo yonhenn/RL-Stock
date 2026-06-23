@@ -1,4 +1,4 @@
-"""Command-line entry point for the Shanghai Index RL experiment."""
+"""Command-line entry point for the NASDAQ-100 index RL experiment."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ DEFAULT_ALGOS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train RL trading agents for Shanghai Index data.")
-    parser.add_argument("--data-path", type=Path, default=Path("output.xlsx"))
+    parser = argparse.ArgumentParser(description="Train RL trading agents for NASDAQ-100 index data.")
+    parser.add_argument("--data-path", type=Path, default=Path("nasdaq100.xlsx"))
     parser.add_argument("--test-start-date", default="2024-01-01")
     parser.add_argument("--window-size", type=int, default=30)
     parser.add_argument("--total-timesteps", type=int, default=100_000)
@@ -36,19 +36,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--env-type",
         choices=["t1", "position"],
-        default="t1",
-        help="t1 = legacy discrete env, position = continuous risk-managed env.",
+        default="position",
+        help="position = continuous risk-managed env (default, suits NASDAQ); "
+        "t1 = legacy discrete env with a China-specific T+1 hold constraint.",
     )
     parser.add_argument(
         "--algorithms",
         type=str,
         default=None,
-        help="Comma-separated list of algorithms (A2C,PPO,SAC,TD3). Defaults depend on --env-type.",
+        help="Comma-separated list of algorithms (A2C,PPO,SAC,TD3,DDPG). Defaults depend on --env-type.",
     )
     parser.add_argument("--initial-cash", type=float, default=1_000_000.0)
     parser.add_argument("--max-position", type=float, default=1.0)
-    parser.add_argument("--stop-loss-pct", type=float, default=0.05)
-    parser.add_argument("--max-drawdown-pct", type=float, default=0.15)
+    parser.add_argument(
+        "--stop-loss-pct",
+        type=float,
+        default=0.0,
+        help="Per-trade hard stop as a fraction of entry; 0 disables it (default).",
+    )
+    parser.add_argument(
+        "--max-drawdown-pct",
+        type=float,
+        default=0.0,
+        help="Equity drawdown lock as a fraction of peak; 0 disables it (default).",
+    )
     parser.add_argument("--trade-fee-rate", type=float, default=0.001)
     parser.add_argument("--vol-target", type=float, default=0.02)
     parser.add_argument("--drawdown-coeff", type=float, default=0.5)
@@ -81,6 +92,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trend-align-coeff", type=float, default=0.0)
     parser.add_argument("--adx-trend-threshold", type=float, default=20.0)
     parser.add_argument("--adx-strong-threshold", type=float, default=40.0)
+    parser.add_argument(
+        "--use-turbulence-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="FinRL-style turbulence circuit breaker: add a turbulence state feature "
+        "and cap exposure on outsized market moves. --env-type position only.",
+    )
+    parser.add_argument("--turbulence-lookback", type=int, default=252)
+    parser.add_argument(
+        "--turbulence-threshold",
+        type=float,
+        default=9.0,
+        help="Squared return z-score above which to de-risk (9.0 == a 3-sigma day).",
+    )
+    parser.add_argument(
+        "--turbulence-exposure-cap",
+        type=float,
+        default=0.0,
+        help="Max |position| while turbulent (0.0 = flatten the book).",
+    )
     return parser.parse_args()
 
 
@@ -138,6 +169,10 @@ def main() -> None:
         trend_align_coeff=args.trend_align_coeff,
         adx_trend_threshold=args.adx_trend_threshold,
         adx_strong_threshold=args.adx_strong_threshold,
+        use_turbulence_gate=args.use_turbulence_gate,
+        turbulence_lookback=args.turbulence_lookback,
+        turbulence_threshold=args.turbulence_threshold,
+        turbulence_exposure_cap=args.turbulence_exposure_cap,
     )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 

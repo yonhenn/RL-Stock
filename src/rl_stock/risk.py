@@ -120,6 +120,48 @@ def compute_atr(
     return atr
 
 
+def compute_turbulence(
+    close: np.ndarray,
+    lookback: int = 252,
+) -> np.ndarray:
+    """Single-asset turbulence index (Kritzman & Li, 2010), 1-D special case.
+
+    The original turbulence index is the Mahalanobis distance of a *cross-section*
+    of asset returns from their historical mean and covariance -- a market-wide
+    "how unusual is today" gauge that spikes during crashes. For a single series
+    the covariance collapses to the variance, so turbulence reduces to the
+    squared z-score of the latest return relative to its trailing distribution::
+
+        turbulence_t = ((r_t - mu_t) / sigma_t) ** 2
+
+    where ``mu_t`` and ``sigma_t`` are the mean and standard deviation of the
+    ``lookback`` returns *strictly before* ``t`` (causal, no look-ahead). Large
+    values flag an unusually large move in *either* direction -- the crash /
+    melt-up days that cluster with elevated volatility. Output is non-negative,
+    the same length as ``close``; warm-up bars without a full trailing window are
+    ``0`` (never flagged as turbulent).
+    """
+    close = np.asarray(close, dtype=float)
+    n = len(close)
+    turbulence = np.zeros(n, dtype=float)
+    if lookback < 2 or n < lookback + 2:
+        return turbulence
+
+    returns = np.zeros(n, dtype=float)
+    returns[1:] = np.diff(close) / np.maximum(np.abs(close[:-1]), EPS)
+
+    # Start at lookback + 1 so the trailing window excludes the returns[0]
+    # placeholder and only ever looks at real, prior returns.
+    for t in range(lookback + 1, n):
+        window = returns[t - lookback : t]
+        sigma = float(np.std(window))
+        if sigma < EPS:
+            continue
+        z = (returns[t] - float(np.mean(window))) / sigma
+        turbulence[t] = z * z
+    return turbulence
+
+
 def compute_win_rate(trade_returns: np.ndarray) -> float:
     """Fraction of trades with strictly positive return."""
     trade_returns = np.asarray(trade_returns, dtype=float)

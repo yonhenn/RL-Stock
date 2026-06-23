@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from rl_stock.envs_v2 import (
     N_PORTFOLIO_FEATURES,
     N_TECH_FEATURES,
     N_TREND_FEATURES,
+    N_TURBULENCE_FEATURES,
     PositionMgmtEnv,
     RiskConfig,
 )
@@ -71,6 +73,96 @@ def test_stop_loss_flattens_position(synthetic_ohlc):
         if term or trunc:
             break
     assert stopped_out, "Tight stop-loss should trigger at least once on noisy data."
+
+
+@pytest.mark.unit
+def test_stop_loss_disabled_when_non_positive(synthetic_ohlc):
+    # stop_loss_pct <= 0 disables the hard stop: it must never flatten the book,
+    # even on the same noisy data where a tight stop triggers.
+    env = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=RiskConfig(stop_loss_pct=0.0, initial_cash=1_000_000.0),
+    )
+    env.reset(seed=0)
+    info: dict = {}
+    for _ in range(60):
+        _, _, term, trunc, info = env.step(np.array([1.0], dtype=np.float32))
+        assert not info.get("stop_triggered"), "Stop must never trigger when disabled."
+        if term or trunc:
+            break
+    assert info["stop_loss_events"] == 0
+
+
+def _declining_ohlc(n: int = 140, total_drop: float = 0.35) -> pd.DataFrame:
+    """Deterministic sustained downtrend: close falls ~``total_drop`` over n bars.
+
+    A full-long agent on this series bleeds equity monotonically, so the
+    peak-to-trough drawdown grows past any threshold -- the clean way to
+    exercise (and to prove the disabling of) the equity drawdown lock.
+    """
+    rng = np.random.default_rng(5)
+    ramp = np.linspace(0.0, -total_drop, n)
+    close = 3000.0 * (1.0 + ramp) + rng.normal(0, 1.0, n)
+    high = close + rng.uniform(1, 5, n)
+    low = close - rng.uniform(1, 5, n)
+    open_ = close + rng.normal(0, 1.0, n)
+    dates = pd.date_range("2022-01-01", periods=n, freq="B")
+    return pd.DataFrame(
+        {"Open": open_, "High": high, "Low": low, "Close": close},
+        index=pd.Index(dates, name="Date"),
+    )
+
+
+@pytest.mark.unit
+def test_hard_constraints_off_by_default():
+    """Default RiskConfig ships both hard rails disabled (reward-driven risk)."""
+    cfg = RiskConfig()
+    assert cfg.stop_loss_pct == 0.0
+    assert cfg.max_drawdown_pct == 0.0
+
+
+@pytest.mark.unit
+def test_drawdown_lock_triggers_on_decline():
+    """A sustained decline past the threshold engages the drawdown lock."""
+    df = _declining_ohlc()
+    env = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(20, len(df)),
+        # Stop-loss off so the decline isn't cut short before the lock engages.
+        risk_config=RiskConfig(stop_loss_pct=0.0, max_drawdown_pct=0.08),
+    )
+    env.reset(seed=0)
+    locked = False
+    for _ in range(len(df)):
+        _, _, term, trunc, info = env.step(np.array([1.0], dtype=np.float32))
+        if info["dd_locked"]:
+            locked = True
+            break
+        if term or trunc:
+            break
+    assert locked, "A drawdown past max_drawdown_pct should engage the lock."
+
+
+@pytest.mark.unit
+def test_drawdown_lock_disabled_when_non_positive():
+    # max_drawdown_pct <= 0 disables the lock: it must never engage, even on a
+    # deep sustained decline that easily breaches any positive threshold.
+    df = _declining_ohlc()
+    env = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(20, len(df)),
+        risk_config=RiskConfig(stop_loss_pct=0.0, max_drawdown_pct=0.0),
+    )
+    env.reset(seed=0)
+    for _ in range(len(df)):
+        _, _, term, trunc, info = env.step(np.array([1.0], dtype=np.float32))
+        assert not info["dd_locked"], "Lock must never engage when disabled."
+        if term or trunc:
+            break
 
 
 @pytest.mark.unit
@@ -259,3 +351,145 @@ def test_prior_env_step_finite_reward(prior_env):
     _, reward, term, _, _ = prior_env.step(np.array([0.5], dtype=np.float32))
     assert np.isfinite(reward)
     assert not term
+
+
+# --------------------------------------------------------------------------- #
+# Turbulence circuit breaker (FinRL-style market-crash risk-off)
+# --------------------------------------------------------------------------- #
+def _shock_ohlc(n: int = 120, shock_idx: int = 60, shock: float = 0.12) -> pd.DataFrame:
+    """Noisy calm OHLC with a single large return shock at ``shock_idx``."""
+    rng = np.random.default_rng(11)
+    returns = rng.normal(0.0005, 0.005, n)
+    returns[shock_idx] = shock
+    close = 3000.0 * np.cumprod(1.0 + returns)
+    high = close * 1.002
+    low = close * 0.998
+    open_ = close * (1.0 + rng.normal(0, 0.0005, n))
+    dates = pd.date_range("2022-01-01", periods=n, freq="B")
+    return pd.DataFrame(
+        {"Open": open_, "High": high, "Low": low, "Close": close},
+        index=pd.Index(dates, name="Date"),
+    )
+
+
+def _turbulence_config(**overrides) -> RiskConfig:
+    params = dict(
+        use_turbulence_gate=True,
+        turbulence_lookback=20,
+        turbulence_threshold=9.0,
+        turbulence_exposure_cap=0.0,
+    )
+    params.update(overrides)
+    return RiskConfig(**params)
+
+
+@pytest.mark.unit
+def test_turbulence_feature_count_constant():
+    assert N_TURBULENCE_FEATURES == 1
+
+
+@pytest.mark.unit
+def test_turbulence_flag_expands_observation_space(synthetic_ohlc):
+    env = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=_turbulence_config(turbulence_lookback=30),
+    )
+    expected = N_TECH_FEATURES + N_TURBULENCE_FEATURES + N_PORTFOLIO_FEATURES
+    assert env.observation_space.shape == (20, expected)
+
+
+@pytest.mark.unit
+def test_turbulence_flag_preserves_base_columns(synthetic_ohlc):
+    """Enabling the gate appends one column without altering the base 13."""
+    base = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=RiskConfig(),
+    )
+    gated = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=_turbulence_config(turbulence_lookback=30),
+    )
+    assert gated.signal_features.shape[1] == N_TECH_FEATURES + N_TURBULENCE_FEATURES
+    np.testing.assert_array_equal(
+        base.signal_features, gated.signal_features[:, :N_TECH_FEATURES]
+    )
+
+
+@pytest.mark.unit
+def test_turbulence_info_keys_present(synthetic_ohlc):
+    env = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=_turbulence_config(turbulence_lookback=30),
+    )
+    _, info = env.reset(seed=0)
+    assert "turbulence" in info
+    _, _, _, _, info = env.step(np.array([0.5], dtype=np.float32))
+    assert "turbulence" in info
+    assert "turbulence_triggered" in info
+    assert info["turbulence"] >= 0.0
+
+
+@pytest.mark.unit
+def test_turbulence_gate_clamps_target(synthetic_ohlc):
+    """Above threshold the target is clamped to the cap; below, it passes through."""
+    env = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=_turbulence_config(turbulence_exposure_cap=0.3, turbulence_lookback=30),
+    )
+    env.reset(seed=0)
+    tick = env._current_tick
+
+    env._turbulence[tick] = 100.0  # force a turbulent tick
+    assert env._apply_turbulence_gate(0.9) == pytest.approx(0.3)
+    assert env._apply_turbulence_gate(-0.9) == pytest.approx(-0.3)
+    assert env._apply_turbulence_gate(0.1) == pytest.approx(0.1)  # within cap, untouched
+
+    env._turbulence[tick] = 0.0  # calm tick -> full pass-through
+    assert env._apply_turbulence_gate(0.9) == pytest.approx(0.9)
+
+
+@pytest.mark.unit
+def test_turbulence_gate_flattens_on_shock():
+    """End-to-end: a full-long agent is forced flat on every turbulent day."""
+    df = _shock_ohlc()
+    env = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(20, len(df)),
+        risk_config=_turbulence_config(),  # cap 0.0 -> flatten
+    )
+    env.reset(seed=0)
+    triggered_any = False
+    for _ in range(len(df)):
+        _, _, term, trunc, info = env.step(np.array([1.0], dtype=np.float32))
+        if info["turbulence_triggered"]:
+            triggered_any = True
+            assert info["position_ratio"] == pytest.approx(0.0)
+        if term or trunc:
+            break
+    assert triggered_any, "The injected shock must trip the turbulence gate."
+
+
+@pytest.mark.unit
+def test_turbulence_gate_off_by_default(synthetic_ohlc):
+    """Default config leaves the observation space and behaviour unchanged."""
+    env = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=RiskConfig(),
+    )
+    assert env.observation_space.shape == (20, N_TECH_FEATURES + N_PORTFOLIO_FEATURES)
+    env.reset(seed=0)
+    _, _, _, _, info = env.step(np.array([0.5], dtype=np.float32))
+    assert info["turbulence_triggered"] is False

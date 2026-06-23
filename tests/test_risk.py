@@ -12,6 +12,7 @@ from rl_stock.risk import (
     compute_max_drawdown,
     compute_sharpe_ratio,
     compute_sortino_ratio,
+    compute_turbulence,
     compute_turnover,
     compute_win_rate,
 )
@@ -65,6 +66,49 @@ def test_atr_length_matches_input():
     atr = compute_atr(high, low, close, period=14)
     assert atr.shape == (n,)
     assert np.all(atr >= 0)
+
+
+@pytest.mark.unit
+def test_turbulence_length_nonneg_and_warmup_zero():
+    rng = np.random.default_rng(1)
+    close = 3000 + np.cumsum(rng.normal(0, 5, 200))
+    turb = compute_turbulence(close, lookback=30)
+    assert turb.shape == (200,)
+    assert np.all(turb >= 0.0)
+    # Warm-up bars (no full trailing window) must never flag turbulence.
+    assert np.all(turb[:31] == 0.0)
+
+
+@pytest.mark.unit
+def test_turbulence_too_short_returns_zeros():
+    close = np.linspace(100.0, 110.0, 10)
+    assert np.all(compute_turbulence(close, lookback=30) == 0.0)
+
+
+@pytest.mark.unit
+def test_turbulence_spikes_on_outlier_move():
+    # Noisy calm period (~0.5% daily vol) with a single ~10% shock: the shock
+    # day must dominate every calm day and clear a 3-sigma (z**2 == 9) cutoff.
+    rng = np.random.default_rng(5)
+    returns = rng.normal(0.0005, 0.005, 100)
+    shock_idx = 60
+    returns[shock_idx] = 0.10
+    close = 1000.0 * np.cumprod(1.0 + returns)
+    turb = compute_turbulence(close, lookback=30)
+    assert turb[shock_idx] > 9.0
+    assert int(np.argmax(turb)) == shock_idx
+
+
+@pytest.mark.unit
+def test_turbulence_is_causal():
+    """turbulence[t] must not depend on any future price."""
+    rng = np.random.default_rng(2)
+    close = 3000 + np.cumsum(rng.normal(0, 5, 120))
+    base = compute_turbulence(close, lookback=30)
+    perturbed = close.copy()
+    perturbed[80:] *= 1.5  # mutate the future only
+    after = compute_turbulence(perturbed, lookback=30)
+    np.testing.assert_array_equal(base[:80], after[:80])
 
 
 @pytest.mark.unit
