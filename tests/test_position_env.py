@@ -14,6 +14,7 @@ from rl_stock.envs_v2 import (
     PositionMgmtEnv,
     RiskConfig,
 )
+from rl_stock.trend import TrendRegime
 
 
 @pytest.fixture
@@ -29,7 +30,7 @@ def env(synthetic_ohlc):
 @pytest.mark.unit
 def test_action_and_observation_spaces(env):
     assert env.action_space.shape == (1,)
-    assert env.action_space.low == -1.0
+    assert env.action_space.low == 0.0  # long-only: no short side
     assert env.action_space.high == 1.0
     assert env.observation_space.shape == (20, N_TECH_FEATURES + N_PORTFOLIO_FEATURES)
 
@@ -297,36 +298,48 @@ def test_trend_prior_anchors_zero_action(prior_env):
 
 @pytest.mark.unit
 def test_residual_is_monotonic_in_action(prior_env):
-    """Larger actions never produce a smaller target around the trend anchor."""
-    down = _step_from_reset(prior_env, -1.0)["position_ratio"]
-    flat = _step_from_reset(prior_env, 0.0)["position_ratio"]
+    """Larger actions never produce a smaller long target around the trend anchor.
+
+    Long-only: the action is in ``[0, 1]``; ``0`` anchors the base long and
+    larger actions only add exposure.
+    """
+    base = _step_from_reset(prior_env, 0.0)["position_ratio"]
+    mid = _step_from_reset(prior_env, 0.5)["position_ratio"]
     up = _step_from_reset(prior_env, 1.0)["position_ratio"]
-    assert up >= flat >= down
-    assert up > down  # the band actually tilts the position
+    assert up >= mid >= base
+    assert up > base  # the band actually tilts the position
 
 
 @pytest.mark.unit
-def test_regime_cap_blocks_counter_trend(trending_ohlc):
-    """With caps on (prior off), a full counter-trend order is clamped to the cap."""
+def test_regime_cap_blocks_counter_trend():
+    """With caps on (prior off), a full long into a STRONG_DOWN regime is capped.
+
+    Long-only: the surviving counter-trend risk is a large long held into a
+    strong down-trend, so the cap clamps it to ``counter_trend_cap``.
+    """
+    df = _declining_ohlc()
     capped = PositionMgmtEnv(
-        df=trending_ohlc,
+        df=df,
         window_size=20,
-        frame_bound=(60, len(trending_ohlc)),
+        frame_bound=(60, len(df)),
         risk_config=RiskConfig(
             use_trend_prior=False, regime_risk_scaling=True, counter_trend_cap=0.2
         ),
     )
     uncapped = PositionMgmtEnv(
-        df=trending_ohlc,
+        df=df,
         window_size=20,
-        frame_bound=(60, len(trending_ohlc)),
+        frame_bound=(60, len(df)),
         risk_config=RiskConfig(use_trend_prior=False, regime_risk_scaling=False),
     )
-    # Short order inside a STRONG_UP regime: the cap forbids large shorts.
-    capped_pos = _step_from_reset(capped, -1.0)["position_ratio"]
-    uncapped_pos = _step_from_reset(uncapped, -1.0)["position_ratio"]
-    assert capped_pos >= -0.2 - 1e-6
-    assert uncapped_pos < capped_pos  # without the cap the short is much larger
+    # Confirm the regime really is STRONG_DOWN, otherwise the cap is a no-op.
+    _, info = capped.reset(seed=0)
+    assert info["regime"] <= float(TrendRegime.STRONG_DOWN)
+    # Full long order inside a STRONG_DOWN regime: the cap forbids large longs.
+    capped_pos = _step_from_reset(capped, 1.0)["position_ratio"]
+    uncapped_pos = _step_from_reset(uncapped, 1.0)["position_ratio"]
+    assert capped_pos <= 0.2 + 1e-6
+    assert uncapped_pos > capped_pos  # without the cap the long is much larger
 
 
 @pytest.mark.unit
@@ -451,7 +464,7 @@ def test_turbulence_gate_clamps_target(synthetic_ohlc):
 
     env._turbulence[tick] = 100.0  # force a turbulent tick
     assert env._apply_turbulence_gate(0.9) == pytest.approx(0.3)
-    assert env._apply_turbulence_gate(-0.9) == pytest.approx(-0.3)
+    assert env._apply_turbulence_gate(-0.9) == pytest.approx(0.0)  # long-only: floor at 0
     assert env._apply_turbulence_gate(0.1) == pytest.approx(0.1)  # within cap, untouched
 
     env._turbulence[tick] = 0.0  # calm tick -> full pass-through

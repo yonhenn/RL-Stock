@@ -1,11 +1,12 @@
-"""Continuous-action position management environment with risk control.
+"""Long-only continuous-action position management environment with risk control.
 
 ``PositionMgmtEnv`` simulates a portfolio account where the agent decides a
-*target position ratio* in [-1, 1] each step. The environment translates that
-target into trades, books transaction costs, optionally enforces stop-loss /
-drawdown hard limits (both off by default, so risk is reward-driven), and
-rewards the agent with a Differential Sharpe Ratio plus penalties for drawdown
-and turnover.
+*target long position ratio* in [0, 1] each step (0 = flat, 1 = fully
+invested; the book is long-only, so no short selling). The environment
+translates that target into trades, books transaction costs, optionally
+enforces stop-loss / drawdown hard limits (both off by default, so risk is
+reward-driven), and rewards the agent with a Differential Sharpe Ratio plus
+penalties for drawdown and turnover.
 """
 
 from __future__ import annotations
@@ -81,9 +82,10 @@ class RiskConfig:
 
 
 class PositionMgmtEnv(gymnasium.Env):
-    """Continuous-action portfolio simulator with embedded risk controls.
+    """Long-only continuous-action portfolio simulator with embedded risk controls.
 
-    Action space: ``Box(-1, 1, shape=(1,))`` -- target net position ratio.
+    Action space: ``Box(0, 1, shape=(1,))`` -- target long position ratio
+    (0 = flat, 1 = fully invested; long-only, no shorting).
     Observation: ``(window_size, n_tech + n_portfolio)`` window of features.
     """
 
@@ -121,7 +123,7 @@ class PositionMgmtEnv(gymnasium.Env):
         )
         n_features = n_tech + N_PORTFOLIO_FEATURES
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(1,), dtype=np.float32
+            low=0.0, high=1.0, shape=(1,), dtype=np.float32
         )
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -172,7 +174,7 @@ class PositionMgmtEnv(gymnasium.Env):
             adx_strong=self.risk.adx_strong_threshold,
         )
         trend_base_full = regime_to_base_position(
-            regime_full, self.risk.trend_base_exposure
+            regime_full, self.risk.trend_base_exposure, long_only=True
         )
 
         start = self.frame_bound[0] - self.window_size
@@ -367,7 +369,11 @@ class PositionMgmtEnv(gymnasium.Env):
         }
 
     def _volatility_scaled_target(self, raw_target: float) -> float:
-        """Scale the agent's target by current volatility (lower vol = bigger size)."""
+        """Scale the agent's target by current volatility (lower vol = bigger size).
+
+        Long-only: the result is clamped to ``[0, max_position]`` so a target can
+        never go short.
+        """
         atr_now = float(self.atr[self._current_tick])
         if atr_now < EPS:
             scale = 1.0
@@ -375,18 +381,21 @@ class PositionMgmtEnv(gymnasium.Env):
             scale = self._base_atr / atr_now
         scale = float(np.clip(scale, 0.25, 2.0))
         scaled = raw_target * scale
-        return float(np.clip(scaled, -self.risk.max_position, self.risk.max_position))
+        return float(np.clip(scaled, 0.0, self.risk.max_position))
 
     def _resolve_target(self, raw_action: float) -> float:
-        """Translate the raw agent action into a target position ratio.
+        """Translate the raw agent action into a target long position ratio.
 
-        With ``use_trend_prior`` the explicit trend judgment supplies a base
-        position (the trend-following anchor) and the action becomes a bounded
-        *tilt* around it (residual policy); otherwise the action is the target
-        directly. The result is volatility-scaled and, when ``regime_risk_scaling``
-        is on, clamped by regime-aware counter-trend caps.
+        The action is a long ratio in ``[0, 1]``. With ``use_trend_prior`` the
+        explicit trend judgment supplies a base long position (the trend-following
+        anchor) and the action becomes an upward *tilt* around it (residual
+        policy: ``action == 0`` holds the base, larger actions add exposure);
+        otherwise the action is the target directly. The result is
+        volatility-scaled, clamped to ``[0, max_position]`` (long-only), and,
+        when ``regime_risk_scaling`` is on, further capped inside a strong
+        down-trend.
         """
-        raw = float(np.clip(raw_action, -1.0, 1.0))
+        raw = float(np.clip(raw_action, 0.0, 1.0))
         if self.risk.use_trend_prior:
             prior = float(self._trend_base[self._current_tick])
             combined = prior + raw * self.risk.residual_band
@@ -400,13 +409,17 @@ class PositionMgmtEnv(gymnasium.Env):
         return target
 
     def _apply_regime_caps(self, target: float) -> float:
-        """Forbid large counter-trend exposure inside a strongly trending regime."""
+        """Cap long exposure inside a strong down-trend (long-only: nothing to cap up).
+
+        With shorting removed the only counter-trend risk left is holding a large
+        long into a strong down-trend, so the cap clamps the long there to
+        ``counter_trend_cap``. A strong up-trend needs no cap (the agent is already
+        long-only, so it can never take the counter-trend short side).
+        """
         regime = float(self._regime[self._current_tick])
         cap = self.risk.counter_trend_cap
         if regime <= float(TrendRegime.STRONG_DOWN):
             target = min(target, cap)
-        elif regime >= float(TrendRegime.STRONG_UP):
-            target = max(target, -cap)
         return float(target)
 
     def _is_turbulent(self) -> bool:
@@ -420,14 +433,14 @@ class PositionMgmtEnv(gymnasium.Env):
         """Risk-off on turbulent days (FinRL's turbulence rule, single-asset).
 
         When the latest move is an outlier (squared return z-score above the
-        threshold) the target is clamped in magnitude to ``turbulence_exposure_cap``
-        regardless of sign, so a market shock forces de-risking. ``cap == 0``
-        flattens the book outright.
+        threshold) the long target is clamped to ``turbulence_exposure_cap``, so a
+        market shock forces de-risking. ``cap == 0`` flattens the book outright.
+        Long-only: the floor stays at ``0`` (the gate never opens a short).
         """
         if not self._is_turbulent():
             return float(target)
         cap = abs(self.risk.turbulence_exposure_cap)
-        return float(np.clip(target, -cap, cap))
+        return float(np.clip(target, 0.0, cap))
 
     def step(self, action):
         if self._terminated or self._truncated:
@@ -531,9 +544,10 @@ class PositionMgmtEnv(gymnasium.Env):
         drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
         drawdown_penalty = -abs(min(drawdown, 0.0))
         turnover_penalty = -abs(delta_position)
-        # Optional: reward holding a position aligned with the trend judgment
-        # (positive when long in an uptrend / short in a downtrend). Off by
-        # default (coeff 0) to keep the objective return/Sharpe-driven.
+        # Optional: reward holding a long aligned with the trend judgment
+        # (positive when long in an uptrend, negative when long into a
+        # downtrend; flat earns nothing). Off by default (coeff 0) to keep the
+        # objective return/Sharpe-driven.
         align_bonus = (
             self.risk.trend_align_coeff
             * float(np.sign(self._position_ratio))

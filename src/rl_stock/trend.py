@@ -146,14 +146,21 @@ def classify_trend_regime(
 def regime_to_base_position(
     regime: np.ndarray,
     base_exposure: float = 0.8,
+    long_only: bool = False,
 ) -> np.ndarray:
-    """Map a discrete regime to a trend-following base position in ``[-1, 1]``.
+    """Map a discrete regime to a trend-following base position.
 
     Linear and symmetric: ``regime / 2 * base_exposure`` so the magnitudes are
     ``{0, base/2, base}``. This is the anchor a residual-policy agent tilts
-    around -- ``STRONG_UP`` anchors a large long, ``SIDEWAYS`` anchors flat,
-    ``STRONG_DOWN`` a large short.
+    around -- ``STRONG_UP`` anchors a large long, ``SIDEWAYS`` anchors flat.
+
+    With ``long_only=False`` (default) the range is ``[-base, base]`` and a
+    ``STRONG_DOWN`` regime anchors a large short. With ``long_only=True`` the
+    short side is removed: the lower bound is clamped to ``0``, so every
+    down-trend regime anchors flat (no shorting) and only up-trends carry a
+    positive base long.
     """
     regime = np.asarray(regime, dtype=float)
     base = regime / 2.0 * base_exposure
-    return np.clip(base, -abs(base_exposure), abs(base_exposure))
+    lower = 0.0 if long_only else -abs(base_exposure)
+    return np.clip(base, lower, abs(base_exposure))
