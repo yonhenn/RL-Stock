@@ -50,7 +50,7 @@ fp = cmp.fp
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-path", type=Path, default=ROOT / "output.xlsx")
+    parser.add_argument("--data-path", type=Path, default=ROOT / "nasdaq100.xlsx")
     parser.add_argument("--t1-dir", type=Path, default=ROOT / "outputs" / "t1")
     parser.add_argument("--position-dir", type=Path, default=ROOT / "outputs" / "position")
     parser.add_argument("--trend-dir", type=Path, default=ROOT / "outputs" / "position_trend")
@@ -328,7 +328,7 @@ def build_summary_html(
     <section>
       <h2>3 · Experimental setup</h2>
       <div class="setup">
-        {stat_block("Shanghai Index", "instrument")}
+        {stat_block("NASDAQ-100 Index", "instrument")}
         {stat_block(data_range, "data range")}
         {stat_block(test_period, "test window")}
         {stat_block(f"{args.window_size} days", "observation window")}

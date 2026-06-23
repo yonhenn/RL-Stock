@@ -26,7 +26,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from rl_stock.data import load_market_data, split_frame_bounds
-from rl_stock.envs import ShanghaiIndexEnvT1
+from rl_stock.envs import IndexTradingEnvT1
 from rl_stock.envs_v2 import PositionMgmtEnv, RiskConfig
 from rl_stock.risk import (
     compute_calmar_ratio,
@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--t1-dir", type=Path, default=ROOT / "outputs" / "t1")
     parser.add_argument("--position-dir", type=Path, default=ROOT / "outputs" / "position")
-    parser.add_argument("--data-path", type=Path, default=ROOT / "output.xlsx")
+    parser.add_argument("--data-path", type=Path, default=ROOT / "nasdaq100.xlsx")
     parser.add_argument("--html", type=Path, default=ROOT / "feature_presentation.html")
     parser.add_argument(
         "--fig-dir",
@@ -154,7 +154,7 @@ def build_test_env(env_key: str, df: pd.DataFrame, args: argparse.Namespace):
         test_start_date=args.test_start_date,
     )
     if env_key == "t1":
-        return ShanghaiIndexEnvT1(
+        return IndexTradingEnvT1(
             df=df,
             window_size=args.window_size,
             frame_bound=test_bound,
@@ -275,7 +275,7 @@ def position_to_exposure(position: Any) -> float:
         return 1.0 if "long" in str(position).lower() else 0.0
 
 
-def t1_trade_returns(env: ShanghaiIndexEnvT1, info: dict[str, Any]) -> np.ndarray:
+def t1_trade_returns(env: IndexTradingEnvT1, info: dict[str, Any]) -> np.ndarray:
     prices = np.asarray(env.prices, dtype=float)
     buy_ticks = info.get("buy_ticks", []) or []
     sell_ticks = info.get("sell_ticks", []) or []
@@ -289,7 +289,7 @@ def t1_trade_returns(env: ShanghaiIndexEnvT1, info: dict[str, Any]) -> np.ndarra
 
 
 def t1_equity_series(
-    env: ShanghaiIndexEnvT1,
+    env: IndexTradingEnvT1,
     info: dict[str, Any],
     initial_equity: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

@@ -1,4 +1,4 @@
-"""Generate and embed presentation figures from the Shanghai index dataset."""
+"""Generate and embed presentation figures from the NASDAQ-100 index dataset."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_PATH = ROOT / "output.xlsx"
+DATA_PATH = ROOT / "nasdaq100.xlsx"
 OUT_DIR = ROOT / "assets" / "generated"
 HTML_PATH = ROOT / "presentation.html"
 TEST_START = pd.Timestamp("2024-01-01")
@@ -124,7 +124,7 @@ def generate_market_overview(df: pd.DataFrame, path: Path) -> None:
 
     ax_price.plot(close.index, close.values, color="#111111", linewidth=1.35)
     ax_price.axvspan(TEST_START, close.index.max(), color="#f0f0f0", zorder=0)
-    ax_price.set_title("Shanghai Composite Index close, 1990-2026", loc="left")
+    ax_price.set_title("NASDAQ-100 Index close, 2014-2026", loc="left")
     ax_price.set_ylabel("Index")
     ax_price.xaxis.set_major_locator(mdates.YearLocator(5))
     ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -157,7 +157,7 @@ def generate_market_overview(df: pd.DataFrame, path: Path) -> None:
     ax_note.text(
         0,
         0.5,
-        f"{len(df):,} daily bars | {df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d} | source: output.xlsx",
+        f"{len(df):,} daily bars | {df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d} | source: nasdaq100.xlsx",
         fontsize=8,
         color="#555555",
         va="center",
@@ -311,7 +311,7 @@ def embed_images(html_path: Path, generated: dict[str, Path]) -> None:
     html = html_path.read_text(encoding="utf-8")
     html = replace_img_src(
         html,
-        "Python-generated Shanghai Composite Index overview chart",
+        "Python-generated NASDAQ-100 Index overview chart",
         image_uri(generated["market"]),
     )
     html = replace_img_src(

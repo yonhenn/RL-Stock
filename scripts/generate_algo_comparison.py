@@ -71,7 +71,7 @@ REGIME_STYLE = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-path", type=Path, default=ROOT / "output.xlsx")
+    parser.add_argument("--data-path", type=Path, default=ROOT / "nasdaq100.xlsx")
     parser.add_argument("--trend-dir", type=Path, default=ROOT / "outputs" / "position_trend")
     parser.add_argument("--html", type=Path, default=ROOT / "algo_comparison.html")
     parser.add_argument(
