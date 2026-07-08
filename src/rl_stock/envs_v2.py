@@ -55,10 +55,24 @@ class RiskConfig:
     max_drawdown_pct: float = 0.0
     trade_fee_rate: float = 0.001
     vol_target: float = 0.02
-    drawdown_coeff: float = 0.5
+    # Reward shaping. ``reward_mode`` picks the objective:
+    #   "return" (default) pays the agent the realized net return each step, so
+    #     holding a long into an uptrend -- and sizing it up -- is directly
+    #     rewarded (a profit-seeking objective).
+    #   "dsr" is the legacy Differential Sharpe Ratio (scale-invariant, so it
+    #     rewards smoothness but is indifferent to how much money is made); kept
+    #     for comparison only.
+    reward_mode: str = "return"
+    drawdown_coeff: float = 0.1
     turnover_coeff: float = 0.1
     sharpe_coeff: float = 1.0
     dsr_eta: float = 0.01
+    # Volatility position-scaling. When on, the agent's target is multiplied by
+    # ``base_atr / current_atr`` (clamped) before clipping -- classic vol
+    # targeting. Off by default: the agent already controls size directly in
+    # [0, 1], and the legacy scaling silently capped upside (it holds ~0.6 avg
+    # exposure for a 1.0 target, roughly halving trend capture).
+    use_vol_scaling: bool = False
     use_trend_features: bool = False
     # Trend-aware position management (residual policy). The explicit trend
     # judgment anchors a base position; the agent learns a bounded tilt around
@@ -390,10 +404,10 @@ class PositionMgmtEnv(gymnasium.Env):
         explicit trend judgment supplies a base long position (the trend-following
         anchor) and the action becomes an upward *tilt* around it (residual
         policy: ``action == 0`` holds the base, larger actions add exposure);
-        otherwise the action is the target directly. The result is
-        volatility-scaled, clamped to ``[0, max_position]`` (long-only), and,
-        when ``regime_risk_scaling`` is on, further capped inside a strong
-        down-trend.
+        otherwise the action is the target directly. The result is optionally
+        volatility-scaled (``use_vol_scaling``, off by default), clamped to
+        ``[0, max_position]`` (long-only), and, when ``regime_risk_scaling`` is
+        on, further capped inside a strong down-trend.
         """
         raw = float(np.clip(raw_action, 0.0, 1.0))
         if self.risk.use_trend_prior:
@@ -401,7 +415,10 @@ class PositionMgmtEnv(gymnasium.Env):
             combined = prior + raw * self.risk.residual_band
         else:
             combined = raw
-        target = self._volatility_scaled_target(combined)
+        if self.risk.use_vol_scaling:
+            target = self._volatility_scaled_target(combined)
+        else:
+            target = float(np.clip(combined, 0.0, self.risk.max_position))
         if self.risk.regime_risk_scaling:
             target = self._apply_regime_caps(target)
         if self.risk.use_turbulence_gate:
@@ -540,26 +557,43 @@ class PositionMgmtEnv(gymnasium.Env):
     def _calculate_reward(
         self, net_return: float, delta_position: float, trend_score: float
     ) -> float:
-        sharpe_component = self._dsr.update(net_return)
         drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
-        drawdown_penalty = -abs(min(drawdown, 0.0))
-        turnover_penalty = -abs(delta_position)
+        # Penalise only the downside of drawdown and only churn; both scale with
+        # their coefficients. Drawdown is already <= 0, so ``min(drawdown, 0)``
+        # keeps the penalty non-positive.
+        drawdown_penalty = min(drawdown, 0.0) * self.risk.drawdown_coeff
+        turnover_penalty = -abs(delta_position) * self.risk.turnover_coeff
         # Optional: reward holding a long aligned with the trend judgment
         # (positive when long in an uptrend, negative when long into a
-        # downtrend; flat earns nothing). Off by default (coeff 0) to keep the
-        # objective return/Sharpe-driven.
+        # downtrend; flat earns nothing). Off by default (coeff 0).
         align_bonus = (
             self.risk.trend_align_coeff
             * float(np.sign(self._position_ratio))
             * trend_score
         )
 
-        reward = (
-            sharpe_component * self.risk.sharpe_coeff
-            + drawdown_penalty * self.risk.drawdown_coeff
-            + turnover_penalty * self.risk.turnover_coeff
-            + align_bonus
-        )
+        if self.risk.reward_mode == "dsr":
+            # Legacy Differential Sharpe Ratio: scale-invariant risk-adjusted
+            # signal. Rewards smoothness but is nearly indifferent to how much
+            # money is made (a half-sized and a full-sized winning position earn
+            # almost the same reward), so it under-participates in trends.
+            sharpe_component = self._dsr.update(net_return)
+            reward = (
+                sharpe_component * self.risk.sharpe_coeff
+                + drawdown_penalty
+                + turnover_penalty
+                + align_bonus
+            )
+        else:
+            # Return-driven objective (default): pay the realized net return
+            # (in percent) so the agent is directly rewarded for capturing --
+            # and for sizing up into -- a profitable move.
+            reward = (
+                net_return * 100.0
+                + drawdown_penalty
+                + turnover_penalty
+                + align_bonus
+            )
         if not np.isfinite(reward):
             return 0.0
         return float(reward)

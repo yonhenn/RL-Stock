@@ -166,6 +166,74 @@ def test_drawdown_lock_disabled_when_non_positive():
             break
 
 
+# --------------------------------------------------------------------------- #
+# Reward modes: return-driven (default) vs legacy scale-invariant DSR
+# --------------------------------------------------------------------------- #
+def _cumulative_reward(df, action: float, **risk_kwargs) -> float:
+    """Sum the per-step reward for a constant action over a full episode."""
+    env = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(60, len(df)),
+        risk_config=RiskConfig(**risk_kwargs),
+    )
+    env.reset(seed=0)
+    total, done = 0.0, False
+    while not done:
+        _, reward, term, trunc, _ = env.step(np.array([action], dtype=np.float32))
+        total += reward
+        done = term or trunc
+    return total
+
+
+@pytest.mark.unit
+def test_reward_mode_defaults_to_return():
+    assert RiskConfig().reward_mode == "return"
+
+
+@pytest.mark.unit
+def test_return_reward_rewards_sizing_into_uptrend(trending_ohlc):
+    """Return mode: on an uptrend, bigger long => strictly more reward.
+
+    This is the property the DSR reward lacked -- it is what makes the agent
+    want to participate in (and size up into) a profitable trend.
+    """
+    flat = _cumulative_reward(trending_ohlc, 0.0, reward_mode="return")
+    half = _cumulative_reward(trending_ohlc, 0.5, reward_mode="return")
+    full = _cumulative_reward(trending_ohlc, 1.0, reward_mode="return")
+    assert full > half > flat
+    assert flat == pytest.approx(0.0, abs=1e-6)  # flat earns (and risks) nothing
+
+
+@pytest.mark.unit
+def test_return_reward_tracks_realized_profit(trending_ohlc):
+    """Return-mode cumulative reward moves with realized profit across sizes.
+
+    The whole point of the return objective: more profit => more reward. (The
+    legacy DSR objective is scale-invariant and breaks this on real noisy data,
+    which is why the agents under-participated in the trend.)
+    """
+    profits, rewards = [], []
+    for action in (0.25, 0.5, 1.0):
+        env = PositionMgmtEnv(
+            df=trending_ohlc,
+            window_size=20,
+            frame_bound=(60, len(trending_ohlc)),
+            risk_config=RiskConfig(reward_mode="return"),
+        )
+        env.reset(seed=0)
+        total, done, info = 0.0, False, {}
+        while not done:
+            _, reward, term, trunc, info = env.step(np.array([action], dtype=np.float32))
+            total += reward
+            done = term or trunc
+        profits.append(info["total_profit"])
+        rewards.append(total)
+    # Both profit and reward are strictly increasing in position size.
+    assert profits[0] < profits[1] < profits[2]
+    assert rewards[0] < rewards[1] < rewards[2]
+
+
 @pytest.mark.unit
 def test_episode_terminates_at_frame_end(synthetic_ohlc):
     env = PositionMgmtEnv(
@@ -343,18 +411,38 @@ def test_regime_cap_blocks_counter_trend():
 
 
 @pytest.mark.unit
-def test_trend_prior_off_matches_volatility_scaling(synthetic_ohlc):
-    """Both trend switches off => target is exactly the legacy vol-scaled action."""
+def test_default_target_passes_action_through(synthetic_ohlc):
+    """Default config (vol scaling off): the target is just the clipped action."""
     env = PositionMgmtEnv(
         df=synthetic_ohlc,
         window_size=20,
         frame_bound=(20, len(synthetic_ohlc)),
-        risk_config=RiskConfig(),  # defaults: use_trend_prior=False, caps off
+        risk_config=RiskConfig(),  # defaults: use_vol_scaling=False
+    )
+    env.reset(seed=0)
+    _, _, _, _, info = env.step(np.array([0.5], dtype=np.float32))
+    assert info["position_ratio"] == pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_vol_scaling_opt_in_matches_scaled_target(synthetic_ohlc):
+    """With vol scaling on, the target is exactly the vol-scaled action."""
+    env = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=RiskConfig(use_vol_scaling=True),
     )
     env.reset(seed=0)
     expected = env._volatility_scaled_target(0.5)  # same tick as the first step
     _, _, _, _, info = env.step(np.array([0.5], dtype=np.float32))
     assert info["position_ratio"] == pytest.approx(expected)
+
+
+@pytest.mark.unit
+def test_vol_scaling_off_by_default():
+    """Volatility scaling ships opt-in (off), so a 1.0 target isn't silently cut."""
+    assert RiskConfig().use_vol_scaling is False
 
 
 @pytest.mark.unit

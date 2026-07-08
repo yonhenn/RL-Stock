@@ -62,7 +62,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trade-fee-rate", type=float, default=0.001)
     parser.add_argument("--vol-target", type=float, default=0.02)
-    parser.add_argument("--drawdown-coeff", type=float, default=0.5)
+    parser.add_argument(
+        "--reward-mode",
+        choices=["return", "dsr"],
+        default="return",
+        help="Reward objective: 'return' (default, profit-seeking: pays realized "
+        "net return) or 'dsr' (legacy scale-invariant Differential Sharpe).",
+    )
+    parser.add_argument(
+        "--use-vol-scaling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Scale the target position by base/current ATR (classic vol "
+        "targeting). Off by default; the agent already controls size and the "
+        "scaling silently caps trend capture. --env-type position only.",
+    )
+    parser.add_argument("--drawdown-coeff", type=float, default=0.1)
     parser.add_argument("--turnover-coeff", type=float, default=0.1)
     parser.add_argument("--sharpe-coeff", type=float, default=1.0)
     parser.add_argument("--dsr-eta", type=float, default=0.01)
@@ -156,10 +171,12 @@ def main() -> None:
         max_drawdown_pct=args.max_drawdown_pct,
         trade_fee_rate=args.trade_fee_rate,
         vol_target=args.vol_target,
+        reward_mode=args.reward_mode,
         drawdown_coeff=args.drawdown_coeff,
         turnover_coeff=args.turnover_coeff,
         sharpe_coeff=args.sharpe_coeff,
         dsr_eta=args.dsr_eta,
+        use_vol_scaling=args.use_vol_scaling,
         use_trend_features=args.use_trend_features,
         use_trend_prior=args.use_trend_prior,
         trend_base_exposure=args.trend_base_exposure,
