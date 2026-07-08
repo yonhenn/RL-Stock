@@ -4,7 +4,9 @@ matplotlib
 numpy
 openpyxl
 pandas
+plotly
 seaborn
 stable-baselines3
+streamlit
 torch
 tqdm
