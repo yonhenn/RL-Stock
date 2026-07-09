@@ -38,6 +38,7 @@ N_TECH_FEATURES = 13
 N_TREND_FEATURES = 6
 N_TURBULENCE_FEATURES = 1
 N_PORTFOLIO_FEATURES = 6
+N_PORTFOLIO_FEATURES_DT = 6  # position, pnl, dd, vol, stop_flag, dd_lock_flag
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,10 @@ class RiskConfig:
     turbulence_lookback: int = 252
     turbulence_threshold: float = 9.0  # z**2; 9.0 == a 3-sigma daily move
     turbulence_exposure_cap: float = 0.0
+    # DT mode: emit a flat (1-D) single-step observation instead of the
+    # sliding-window 2-D tensor, and swap portfolio features to the DT set
+    # (position, pnl, drawdown, volatility, stop_flag, dd_lock_flag).
+    flat_obs: bool = False
 
 
 class PositionMgmtEnv(gymnasium.Env):
@@ -119,16 +124,25 @@ class PositionMgmtEnv(gymnasium.Env):
             + (N_TREND_FEATURES if self.risk.use_trend_features else 0)
             + (N_TURBULENCE_FEATURES if self.risk.use_turbulence_gate else 0)
         )
-        n_features = n_tech + N_PORTFOLIO_FEATURES
+        n_portfolio = N_PORTFOLIO_FEATURES_DT if self.risk.flat_obs else N_PORTFOLIO_FEATURES
+        n_features = n_tech + n_portfolio
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(1,), dtype=np.float32
         )
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(window_size, n_features),
-            dtype=np.float32,
-        )
+        if self.risk.flat_obs:
+            self.observation_space = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(n_features,),
+                dtype=np.float32,
+            )
+        else:
+            self.observation_space = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(window_size, n_features),
+                dtype=np.float32,
+            )
 
         self._start_tick = self.window_size
         self._end_tick = len(self.prices) - 1
@@ -219,7 +233,8 @@ class PositionMgmtEnv(gymnasium.Env):
         bb_width = bb_upper - bb_lower
         bb_position = np.clip((close - bb_lower) / np.maximum(bb_width, eps) * 100, 0, 100)
         rsi_norm = rsi / 100.0 * 2 - 1
-        macd_max = np.maximum(np.abs(macd_hist).max(), eps)
+        macd_cummax = np.maximum.accumulate(np.abs(macd_hist))
+        macd_max = np.maximum(macd_cummax, eps)
         macd_norm = macd_hist / macd_max
         amplitude = (high - low) / np.maximum(close, eps) * 100
         body = (close - open_) / np.maximum(close, eps) * 100
@@ -335,13 +350,50 @@ class PositionMgmtEnv(gymnasium.Env):
             dtype=np.float32,
         )
 
+    def _get_portfolio_features_dt(self) -> np.ndarray:
+        """DT-specific portfolio features: position, pnl, dd, vol, stop/dd flags."""
+        current_price = float(self.prices[self._current_tick])
+        unrealized_pnl = 0.0
+        if abs(self._position_ratio) > EPS and self._entry_price > EPS:
+            unrealized_pnl = (
+                (current_price - self._entry_price)
+                / self._entry_price
+                * np.sign(self._position_ratio)
+            )
+        drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
+        atr_now = float(self.atr[self._current_tick])
+        volatility = atr_now / max(current_price, EPS)
+        stop_flag = 1.0 if self._stopped_out else 0.0
+        dd_lock_flag = 1.0 if self._dd_locked else 0.0
+        return np.array(
+            [
+                self._position_ratio,
+                np.clip(unrealized_pnl, -1.0, 1.0),
+                np.clip(drawdown, -1.0, 1.0),
+                float(volatility),
+                stop_flag,
+                dd_lock_flag,
+            ],
+            dtype=np.float32,
+        )
+
     def _get_observation(self) -> np.ndarray:
+        if self.risk.flat_obs:
+            tech = self.signal_features[self._current_tick]  # (n_tech,)
+            portfolio = self._get_portfolio_features_dt()     # (6,)
+            return np.concatenate([tech, portfolio]).astype(np.float32)
         end = self._current_tick
         start = end - self.window_size
         tech = self.signal_features[start:end]
         portfolio_row = self._get_portfolio_features()
         portfolio_block = np.tile(portfolio_row, (self.window_size, 1))
         return np.concatenate([tech, portfolio_block], axis=1).astype(np.float32)
+
+    def _get_flat_observation_dt(self) -> np.ndarray:
+        """Helper to get single-step flat DT observation."""
+        tech = self.signal_features[self._current_tick]
+        portfolio = self._get_portfolio_features_dt()
+        return np.concatenate([tech, portfolio]).astype(np.float32)
 
     def _get_info(self) -> dict:
         return {
@@ -364,6 +416,7 @@ class PositionMgmtEnv(gymnasium.Env):
             "trend_score": float(self._trend_score[self._current_tick]),
             "trend_base": float(self._trend_base[self._current_tick]),
             "turbulence": float(self._turbulence[self._current_tick]),
+            "flat_obs": self._get_flat_observation_dt(),
         }
 
     def _volatility_scaled_target(self, raw_target: float) -> float:
@@ -506,7 +559,7 @@ class PositionMgmtEnv(gymnasium.Env):
         if flatten and abs(prev_position) > EPS:
             self._trade_returns.append(unrealized_pnl)
 
-        reward = self._calculate_reward(
+        reward, reward_components = self._calculate_reward(
             net_return, delta_position, float(self._trend_score[prev_tick])
         )
 
@@ -522,11 +575,15 @@ class PositionMgmtEnv(gymnasium.Env):
             self.risk.use_turbulence_gate
             and self._turbulence[prev_tick] > self.risk.turbulence_threshold
         )
+        info["raw_action"] = raw_action
+        info["executed_action"] = target_position
+        info["net_return"] = net_return
+        info["reward_components"] = reward_components
         return observation, reward, self._terminated, self._truncated, info
 
     def _calculate_reward(
         self, net_return: float, delta_position: float, trend_score: float
-    ) -> float:
+    ) -> tuple[float, dict[str, float]]:
         sharpe_component = self._dsr.update(net_return)
         drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
         drawdown_penalty = -abs(min(drawdown, 0.0))
@@ -540,15 +597,20 @@ class PositionMgmtEnv(gymnasium.Env):
             * trend_score
         )
 
-        reward = (
-            sharpe_component * self.risk.sharpe_coeff
-            + drawdown_penalty * self.risk.drawdown_coeff
-            + turnover_penalty * self.risk.turnover_coeff
-            + align_bonus
-        )
+        dsr_term = sharpe_component * self.risk.sharpe_coeff
+        dd_term = drawdown_penalty * self.risk.drawdown_coeff
+        to_term = turnover_penalty * self.risk.turnover_coeff
+        reward = dsr_term + dd_term + to_term + align_bonus
+
+        components = {
+            "dsr": float(dsr_term),
+            "drawdown": float(dd_term),
+            "turnover": float(to_term),
+            "align": float(align_bonus),
+        }
         if not np.isfinite(reward):
-            return 0.0
-        return float(reward)
+            return 0.0, components
+        return float(reward), components
 
     def render(self):  # pragma: no cover - rendering handled via visualization module
         return None

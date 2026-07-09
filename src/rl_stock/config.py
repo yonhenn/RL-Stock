@@ -60,3 +60,5 @@ class ExperimentConfig:
     turbulence_lookback: int = 252
     turbulence_threshold: float = 9.0
     turbulence_exposure_cap: float = 0.0
+    # DT mode: flat (1-D) single-step observation for Decision Transformer.
+    flat_obs: bool = False

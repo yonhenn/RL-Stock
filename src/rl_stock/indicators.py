@@ -72,7 +72,7 @@ def compute_bollinger_bands(
         empty = np.array([], dtype=float)
         return empty, empty, empty
 
-    sma = np.convolve(prices, np.ones(period) / period, mode="same")
+    sma = historical_moving_average(prices, period)
     rolling_std = np.array(
         [
             np.std(prices[max(0, i - period + 1) : i + 1])

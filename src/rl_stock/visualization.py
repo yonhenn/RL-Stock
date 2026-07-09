@@ -318,3 +318,204 @@ def plot_risk_dashboard(env: PositionMgmtEnv, info: dict, model_name: str):
         fontweight="bold",
     )
     return fig
+
+
+def plot_pareto_frontier(
+    dt_results: list[dict],
+    baseline_results: dict[str, dict],
+    ax=None,
+):
+    """Plot the Return vs Max Drawdown Pareto Frontier.
+
+    Highlights dominated points and shows PPO/SAC/Random baseline benchmarks.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+    else:
+        fig = ax.figure
+
+    # Extract DT points
+    x_vals = np.array([r["max_dd"] for r in dt_results])
+    y_vals = np.array([r["profit"] for r in dt_results])
+    sats = np.array([r["saturation"] for r in dt_results])
+    rtgs = np.array([r["rtg"] for r in dt_results])
+
+    # Find Pareto optimal points (Minimize X (Drawdown), Maximize Y (Profit))
+    # Sort by X ascending, then by Y descending
+    sorted_pts = sorted(zip(x_vals, y_vals, sats, rtgs), key=lambda p: (p[0], -p[1]))
+    
+    pareto_pts = []
+    max_y = -np.inf
+    for pt in sorted_pts:
+        x, y, sat, rtg = pt
+        if y > max_y:
+            pareto_pts.append((x, y, sat, rtg))
+            max_y = y
+
+    pareto_x = np.array([p[0] for p in pareto_pts])
+    pareto_y = np.array([p[1] for p in pareto_pts])
+
+    # Plot Pareto Frontier line
+    ax.plot(pareto_x, pareto_y, color="#1f77b4", linestyle="-", linewidth=2.5, zorder=2, label="Pareto Frontier")
+    
+    # Scatter plot all DT points colored by their action saturation rate
+    sc = ax.scatter(
+        x_vals,
+        y_vals,
+        c=sats,
+        cmap="YlOrRd",
+        edgecolors="black",
+        s=120,
+        linewidths=1.2,
+        zorder=3,
+        vmin=0,
+        vmax=20,
+    )
+    
+    # Add colorbar for action saturation
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("Action Saturation Rate (%)", fontsize=11, fontweight="bold")
+
+    # Annotate DT points with their target RTGs
+    for x, y, sat, rtg in zip(x_vals, y_vals, sats, rtgs):
+        offset = (8, -5) if rtg != 0.8 else (-35, 10)
+        ax.annotate(
+            f"RTG={rtg:.2f}",
+            (x, y),
+            textcoords="offset points",
+            xytext=offset,
+            fontsize=9,
+            fontweight="bold" if rtg == 0.8 else "normal",
+        )
+
+    # Plot Baselines (PPO, SAC, Random)
+    markers = {"Random": "o", "PPO": "*", "SAC": "D"}
+    colors = {"Random": "gray", "PPO": "#2ca02c", "SAC": "#ff7f0e"}
+    
+    for name, stats in baseline_results.items():
+        if stats:
+            ax.scatter(
+                stats["max_dd"],
+                stats["profit"],
+                marker=markers.get(name, "X"),
+                color=colors.get(name, "purple"),
+                edgecolors="black",
+                s=180,
+                linewidths=1.5,
+                zorder=4,
+                label=f"{name} Baseline",
+            )
+            ax.annotate(
+                name,
+                (stats["max_dd"], stats["profit"]),
+                textcoords="offset points",
+                xytext=(8, 8),
+                fontsize=10,
+                fontweight="bold",
+            )
+
+    # Highlight dominated zone
+    # Use fill_between to shade the dominated area below the frontier
+    if len(pareto_x) > 0:
+        # Extend Pareto line to the right edge of plot to cover the dominated area
+        ext_x = np.append(pareto_x, [max(x_vals.max() + 1, 18)])
+        ext_y = np.append(pareto_y, [pareto_y[-1]])
+        ax.fill_between(
+            ext_x,
+            ext_y,
+            ax.get_ylim()[0] if ax.get_ylim()[0] < 0 else -20,
+            color="gray",
+            alpha=0.08,
+            zorder=1,
+            label="Dominated Zone",
+        )
+
+    ax.set_title("Return vs. Drawdown Pareto Frontier", fontsize=13, fontweight="bold", pad=12)
+    ax.set_xlabel("Maximum Drawdown (%)", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Cumulative Profit (%)", fontsize=11, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10, loc="lower left")
+    return fig
+
+
+def plot_rtg_calibration(
+    dt_results: list[dict],
+    ax=None,
+):
+    """Plot target RTG vs actual realized return."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 5))
+    else:
+        fig = ax.figure
+
+    target_rtgs = np.array([r["rtg"] for r in dt_results])
+    realized_profits = np.array([r["profit"] for r in dt_results])
+
+    # Sort for plotting line
+    sort_idx = np.argsort(target_rtgs)
+    xs = target_rtgs[sort_idx]
+    ys = realized_profits[sort_idx]
+
+    ax.plot(xs, ys, marker="o", color="#1f77b4", linewidth=2.5, label="DT Realized Performance")
+    
+    # Draw target line y = x * 100 (representing 100% target match)
+    # Target RTG is cumulative return of episode (e.g. 0.3 = 30%)
+    ref_xs = np.linspace(min(xs), max(xs), 100)
+    ref_ys = ref_xs * 100.0
+    ax.plot(ref_xs, ref_ys, color="gray", linestyle="--", alpha=0.6, label="Perfect Alignment (y = x)")
+
+    # Shading areas
+    ax.fill_between(xs, ys, xs * 100, where=(ys > xs * 100), color="green", alpha=0.08, label="Outperformance")
+    ax.fill_between(xs, ys, xs * 100, where=(ys < xs * 100), color="red", alpha=0.08, label="Underperformance")
+
+    ax.set_title("Target RTG Calibration Curve", fontsize=13, fontweight="bold", pad=12)
+    ax.set_xlabel("Commanded Target RTG (Goal)", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Actual Cumulative Return (%)", fontsize=11, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10, loc="upper left")
+    return fig
+
+
+def plot_action_saturation_distribution(
+    results_actions: dict[float, np.ndarray],
+    ax=None,
+):
+    """Plot action distribution Box plot for each RTG."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+    else:
+        fig = ax.figure
+
+    sorted_rtgs = sorted(results_actions.keys())
+    data = [results_actions[rtg] for rtg in sorted_rtgs]
+    labels = [f"{rtg:.2f}" for rtg in sorted_rtgs]
+
+    # Plot boxplot
+    bp = ax.boxplot(
+        data,
+        tick_labels=labels,
+        patch_artist=True,
+        medianprops={"color": "black", "linewidth": 1.5},
+        boxprops={"facecolor": "#e74c3c", "edgecolor": "black", "alpha": 0.7},
+        whiskerprops={"color": "gray", "linewidth": 1.2},
+        capprops={"color": "gray", "linewidth": 1.2},
+    )
+
+    # Alternate colors of boxes slightly based on RTG to make it pretty
+    colors = ["#3498db" if float(label) < 0.8 else "#2ecc71" if float(label) <= 1.5 else "#e74c3c" for label in labels]
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+
+    # Highlight saturation boundaries at +0.95 and -0.95
+    ax.axhline(0.95, color="red", linestyle=":", alpha=0.7, linewidth=1.5)
+    ax.axhline(-0.95, color="red", linestyle=":", alpha=0.7, linewidth=1.5)
+    ax.text(len(sorted_rtgs) - 0.3, 0.98, "+0.95 Threshold", color="red", fontsize=8, ha="right")
+    ax.text(len(sorted_rtgs) - 0.3, -0.92, "-0.95 Threshold", color="red", fontsize=8, ha="right")
+
+    ax.set_title("Action Distributions & Saturation Limits", fontsize=13, fontweight="bold", pad=12)
+    ax.set_xlabel("Target RTG (Commanded Goal)", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Action Outputs (Target Positions)", fontsize=11, fontweight="bold")
+    ax.set_ylim(-1.1, 1.1)
+    ax.grid(True, alpha=0.3, axis="y")
+    return fig
+

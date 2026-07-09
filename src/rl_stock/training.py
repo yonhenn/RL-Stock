@@ -204,6 +204,7 @@ def _build_envs(config: ExperimentConfig, df, train_bound, test_bound):
             turbulence_lookback=config.turbulence_lookback,
             turbulence_threshold=config.turbulence_threshold,
             turbulence_exposure_cap=config.turbulence_exposure_cap,
+            flat_obs=config.flat_obs,
         )
         train_env = PositionMgmtEnv(
             df=df,
