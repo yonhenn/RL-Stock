@@ -95,10 +95,16 @@ def main() -> None:
     parser.add_argument("--bc-checkpoint", type=Path, default=Path("outputs/long_only_v2_mvp/bc/bc_model.pt"))
     parser.add_argument("--sac-model", type=Path, default=Path("outputs/long_only/sac.zip"))
     parser.add_argument("--ppo-model", type=Path, default=Path("outputs/long_only/ppo.zip"))
-    parser.add_argument("--v1-comparison", type=Path, default=Path("outputs/long_only/comparison_dt_bc.pkl"))
+    parser.add_argument("--v1-comparison", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/long_only_v2_mvp"))
     parser.add_argument("--test-start-date", default="2024-01-01")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Evaluate [0,1] actions; --no-long-only evaluates [-1,1].",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +116,7 @@ def main() -> None:
         stop_loss_pct=0.05,
         max_drawdown_pct=0.15,
         use_trend_features=True,
-        long_only=True,
+        long_only=args.long_only,
     )
     env_window = PositionMgmtEnv(
         df, 30, test_bound, RiskConfig(flat_obs=False, **common_risk)
@@ -129,13 +135,18 @@ def main() -> None:
             stop_loss_pct=0.0,
             max_drawdown_pct=0.0,
             use_trend_features=True,
-            long_only=True,
+            long_only=args.long_only,
         ),
     )
 
     rows: list[dict[str, Any]] = []
     rows.append(metrics_from_info("Random (seed 42)", evaluate_policy(None, env_window, args.seed)))
-    for label, exposure in (("Fixed 25% (direct)", 0.25), ("Fixed 50% (direct)", 0.5), ("Fixed 75% (direct)", 0.75), ("Passive Buy & Hold", 1.0)):
+    direct_baselines = (
+        (("Fixed 25% (direct)", 0.25), ("Fixed 50% (direct)", 0.5), ("Fixed 75% (direct)", 0.75), ("Passive Buy & Hold", 1.0))
+        if args.long_only
+        else (("Always Short (direct)", -1.0), ("Fixed -50% (direct)", -0.5), ("Cash", 0.0), ("Fixed +50% (direct)", 0.5), ("Passive Buy & Hold", 1.0))
+    )
+    for label, exposure in direct_baselines:
         rows.append(
             metrics_from_info(
                 label,
@@ -184,9 +195,10 @@ def main() -> None:
         [trajectory[0]["rtg"] for trajectory in dataset["trajectories"]],
         dtype=float,
     )
+    target_percentiles = (50, 75, 90) if args.long_only else (10, 50, 90)
     target_map = {
         percentile: float(np.percentile(starting_rtgs, percentile))
-        for percentile in (50, 75, 90)
+        for percentile in target_percentiles
     }
     for percentile, target in target_map.items():
         _, _, dt_infos = evaluate_dt_model(
@@ -203,10 +215,15 @@ def main() -> None:
         rows.append(metrics_from_info(f"DT V2 RTG P{percentile}", dt_infos[0]))
 
     historical: dict[str, Any] = {}
-    if args.v1_comparison.exists():
+    if args.v1_comparison is not None and args.v1_comparison.exists():
         with args.v1_comparison.open("rb") as handle:
             historical_raw = pickle.load(handle)
-        for key, label in (("bc", "BC V1 historical"), ("dt08", "DT V1 historical RTG 2.4")):
+        historical_dt_label = (
+            "DT V1 historical RTG 2.4"
+            if args.long_only
+            else "DT V1 historical RTG 0.8"
+        )
+        for key, label in (("bc", "BC V1 historical"), ("dt08", historical_dt_label)):
             item = historical_raw.get(key)
             if item:
                 historical[label] = {
@@ -236,16 +253,16 @@ def main() -> None:
     fig, axis = plt.subplots(figsize=(14, 8))
     for row in rows:
         if row["strategy"] in {
+            "Always Short (direct)",
             "Passive Buy & Hold",
             "SAC V1",
             "BC V2",
-            "DT V2 RTG P50",
-            "DT V2 RTG P75",
-            "DT V2 RTG P90",
+            *(f"DT V2 RTG P{p}" for p in target_percentiles),
         }:
             equity = row["equity_curve"]
             axis.plot((equity / equity[0] - 1.0) * 100.0, label=row["strategy"])
-    axis.set_title("Long-Only MVP: Test Equity Curves (2024-2026)")
+    action_label = "Long-Only [0,1]" if args.long_only else "Symmetric [-1,1]"
+    axis.set_title(f"{action_label} MVP: Test Equity Curves (2024-2026)")
     axis.set_xlabel("Trading step")
     axis.set_ylabel("Cumulative return (%)")
     axis.grid(alpha=0.25)
@@ -260,7 +277,7 @@ def main() -> None:
         "checkpoint_selection": "final_epoch",
         "dt_targets": {f"P{k}": v for k, v in target_map.items()},
         "dynamic_rtg": True,
-        "long_only": True,
+        "long_only": args.long_only,
         "historical_v1": historical,
     }
     (args.output_dir / "run_config.json").write_text(

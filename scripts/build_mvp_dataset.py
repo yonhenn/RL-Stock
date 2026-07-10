@@ -116,6 +116,12 @@ def main() -> None:
     parser.add_argument("--test-start-date", default="2024-01-01")
     parser.add_argument("--episodes-per-source", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use [0,1] actions; --no-long-only uses [-1,1].",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -131,7 +137,7 @@ def main() -> None:
         stop_loss_pct=0.05,
         max_drawdown_pct=0.15,
         use_trend_features=True,
-        long_only=True,
+        long_only=args.long_only,
     )
     env = PositionMgmtEnv(
         df=df, window_size=30, frame_bound=train_bound, risk_config=risk
@@ -141,14 +147,28 @@ def main() -> None:
         raise FileNotFoundError("Both SAC and PPO checkpoints are required")
     sac = SAC.load(args.sac_model, env=env)
     ppo = PPO.load(args.ppo_model, env=env)
+    expected_low = 0.0 if args.long_only else -1.0
+    for name, model in (("SAC", sac), ("PPO", ppo)):
+        if not np.allclose(model.action_space.low, expected_low) or not np.allclose(
+            model.action_space.high, 1.0
+        ):
+            raise ValueError(
+                f"{name} checkpoint action space {model.action_space} is incompatible "
+                f"with expected [{expected_low}, 1.0]"
+            )
 
     requests: list[tuple[str, Any | None, int, bool]] = []
     for offset in range(args.episodes_per_source):
         requests.append(("Random", None, args.seed + offset, False))
         requests.append(("SAC-Stochastic", sac, args.seed + 100 + offset, False))
         requests.append(("PPO-Stochastic", ppo, args.seed + 200 + offset, False))
-    for index, position in enumerate((0.0, 0.25, 0.5, 0.75, 1.0)):
-        label = "BuyAndHold" if position == 1.0 else f"Fixed-{position:.2f}"
+    fixed_targets = (
+        (0.0, 0.25, 0.5, 0.75, 1.0)
+        if args.long_only
+        else (-1.0, -0.5, 0.0, 0.5, 1.0)
+    )
+    for index, position in enumerate(fixed_targets):
+        label = f"Fixed-{position:+.2f}"
         requests.append(
             (label, FixedPositionPolicy(position), args.seed + 300 + index, True)
         )
@@ -207,7 +227,7 @@ def main() -> None:
         "duplicate_episodes_removed": len(duplicate_records),
         "state_dim": int(trajectories[0][0]["state"].shape[0]),
         "action_dim": 1,
-        "long_only": True,
+        "long_only": args.long_only,
         "test_start_date": args.test_start_date,
     }
     dataset = {"trajectories": trajectories, "metadata": metadata}
@@ -234,6 +254,11 @@ def main() -> None:
             "min": float(np.min(all_executed)),
             "mean": float(np.mean(all_executed)),
             "max": float(np.max(all_executed)),
+        },
+        "executed_position_step_proportions": {
+            "short": float(np.mean(all_executed < -1e-8)),
+            "flat": float(np.mean(np.abs(all_executed) <= 1e-8)),
+            "long": float(np.mean(all_executed > 1e-8)),
         },
         "trajectories": summaries,
         "duplicates_removed": duplicate_records,
