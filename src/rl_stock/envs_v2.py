@@ -83,6 +83,7 @@ class RiskConfig:
     # DT mode: emit a flat (1-D) single-step observation instead of the
     # sliding-window 2-D tensor, and swap portfolio features to the DT set
     # (position, pnl, drawdown, volatility, stop_flag, dd_lock_flag).
+    long_only: bool = True
     flat_obs: bool = False
 
 
@@ -128,8 +129,9 @@ class PositionMgmtEnv(gymnasium.Env):
         )
         n_portfolio = N_PORTFOLIO_FEATURES_DT if self.risk.flat_obs else N_PORTFOLIO_FEATURES
         n_features = n_tech + n_portfolio
+        low_action = 0.0 if self.risk.long_only else -1.0
         self.action_space = spaces.Box(
-            low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            low=low_action, high=1.0, shape=(1,), dtype=np.float32
         )
         if self.risk.flat_obs:
             self.observation_space = spaces.Box(
@@ -188,7 +190,7 @@ class PositionMgmtEnv(gymnasium.Env):
             adx_strong=self.risk.adx_strong_threshold,
         )
         trend_base_full = regime_to_base_position(
-            regime_full, self.risk.trend_base_exposure, long_only=True
+            regime_full, self.risk.trend_base_exposure, long_only=self.risk.long_only
         )
 
         start = self.frame_bound[0] - self.window_size
@@ -307,6 +309,8 @@ class PositionMgmtEnv(gymnasium.Env):
         self._dsr.reset()
         self._equity_curve: list[float] = [self._equity]
         self._position_history: list[float] = [0.0]
+        self._raw_action_history: list[float] = []
+        self._executed_action_history: list[float] = []
         self._returns: list[float] = []
         self._trade_returns: list[float] = []
         self._stop_loss_events = 0
@@ -411,6 +415,8 @@ class PositionMgmtEnv(gymnasium.Env):
             "stop_loss_events": self._stop_loss_events,
             "equity_curve": list(self._equity_curve),
             "position_history": list(self._position_history),
+            "raw_action_history": list(self._raw_action_history),
+            "executed_action_history": list(self._executed_action_history),
             "trade_returns": list(self._trade_returns),
             "returns": list(self._returns),
             "dd_locked": self._dd_locked,
@@ -425,7 +431,7 @@ class PositionMgmtEnv(gymnasium.Env):
         """Scale the agent's target by current volatility (lower vol = bigger size).
 
         Long-only: the result is clamped to ``[0, max_position]`` so a target can
-        never go short.
+        never go short. Otherwise ``[-max_position, max_position]``.
         """
         atr_now = float(self.atr[self._current_tick])
         if atr_now < EPS:
@@ -434,21 +440,21 @@ class PositionMgmtEnv(gymnasium.Env):
             scale = self._base_atr / atr_now
         scale = float(np.clip(scale, 0.25, 2.0))
         scaled = raw_target * scale
-        return float(np.clip(scaled, 0.0, self.risk.max_position))
+        low = 0.0 if self.risk.long_only else -self.risk.max_position
+        return float(np.clip(scaled, low, self.risk.max_position))
 
     def _resolve_target(self, raw_action: float) -> float:
-        """Translate the raw agent action into a target long position ratio.
+        """Translate the raw agent action into a target position ratio.
 
-        The action is a long ratio in ``[0, 1]``. With ``use_trend_prior`` the
-        explicit trend judgment supplies a base long position (the trend-following
-        anchor) and the action becomes an upward *tilt* around it (residual
-        policy: ``action == 0`` holds the base, larger actions add exposure);
-        otherwise the action is the target directly. The result is
-        volatility-scaled, clamped to ``[0, max_position]`` (long-only), and,
-        when ``regime_risk_scaling`` is on, further capped inside a strong
-        down-trend.
+        The action is a ratio in ``[low, 1]``. With ``use_trend_prior`` the
+        explicit trend judgment supplies a base position (the trend-following
+        anchor) and the action becomes a bounded *tilt* around it (residual
+        policy); otherwise the action is the target directly. The result is
+        volatility-scaled, clamped, and, when ``regime_risk_scaling`` is on,
+        further capped inside trending regimes.
         """
-        raw = float(np.clip(raw_action, 0.0, 1.0))
+        low_action = 0.0 if self.risk.long_only else -1.0
+        raw = float(np.clip(raw_action, low_action, 1.0))
         if self.risk.use_trend_prior:
             prior = float(self._trend_base[self._current_tick])
             combined = prior + raw * self.risk.residual_band
@@ -462,17 +468,13 @@ class PositionMgmtEnv(gymnasium.Env):
         return target
 
     def _apply_regime_caps(self, target: float) -> float:
-        """Cap long exposure inside a strong down-trend (long-only: nothing to cap up).
-
-        With shorting removed the only counter-trend risk left is holding a large
-        long into a strong down-trend, so the cap clamps the long there to
-        ``counter_trend_cap``. A strong up-trend needs no cap (the agent is already
-        long-only, so it can never take the counter-trend short side).
-        """
+        """Forbid large counter-trend exposure inside a strongly trending regime."""
         regime = float(self._regime[self._current_tick])
         cap = self.risk.counter_trend_cap
         if regime <= float(TrendRegime.STRONG_DOWN):
             target = min(target, cap)
+        elif not self.risk.long_only and regime >= float(TrendRegime.STRONG_UP):
+            target = max(target, -cap)
         return float(target)
 
     def _is_turbulent(self) -> bool:
@@ -483,17 +485,12 @@ class PositionMgmtEnv(gymnasium.Env):
         )
 
     def _apply_turbulence_gate(self, target: float) -> float:
-        """Risk-off on turbulent days (FinRL's turbulence rule, single-asset).
-
-        When the latest move is an outlier (squared return z-score above the
-        threshold) the long target is clamped to ``turbulence_exposure_cap``, so a
-        market shock forces de-risking. ``cap == 0`` flattens the book outright.
-        Long-only: the floor stays at ``0`` (the gate never opens a short).
-        """
+        """Risk-off on turbulent days (FinRL's turbulence rule, single-asset)."""
         if not self._is_turbulent():
             return float(target)
         cap = abs(self.risk.turbulence_exposure_cap)
-        return float(np.clip(target, 0.0, cap))
+        low = 0.0 if self.risk.long_only else -cap
+        return float(np.clip(target, low, cap))
 
     def step(self, action):
         if self._terminated or self._truncated:
@@ -566,6 +563,8 @@ class PositionMgmtEnv(gymnasium.Env):
 
         self._equity_curve.append(self._equity)
         self._position_history.append(target_position)
+        self._raw_action_history.append(raw_action)
+        self._executed_action_history.append(target_position)
         self._returns.append(net_return)
 
         flatten = stop_triggered or (abs(prev_position) > EPS and abs(target_position) < EPS)
@@ -578,6 +577,9 @@ class PositionMgmtEnv(gymnasium.Env):
 
         if self._equity <= 0:
             self._terminated = True
+
+        if self.risk.long_only:
+            assert self._position_ratio >= -1e-6, f"Position ratio went negative: {self._position_ratio}"
 
         observation = self._get_observation()
         info = self._get_info()

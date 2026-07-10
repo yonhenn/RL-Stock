@@ -49,6 +49,10 @@ def test_step_returns_finite_reward(env):
     env.reset(seed=0)
     obs, reward, term, trunc, info = env.step(np.array([0.5], dtype=np.float32))
     assert np.isfinite(reward)
+    assert info["raw_action_history"] == pytest.approx([0.5])
+    assert info["executed_action_history"] == pytest.approx(
+        [info["position_ratio"]]
+    )
     assert obs.shape == env.observation_space.shape
     assert not term
 
@@ -506,3 +510,31 @@ def test_turbulence_gate_off_by_default(synthetic_ohlc):
     env.reset(seed=0)
     _, _, _, _, info = env.step(np.array([0.5], dtype=np.float32))
     assert info["turbulence_triggered"] is False
+
+
+@pytest.mark.unit
+def test_long_only_vs_symmetric_clipping(synthetic_ohlc):
+    # Test long_only=True
+    env_long = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=RiskConfig(long_only=True),
+    )
+    assert env_long.action_space.low[0] == 0.0
+    env_long.reset(seed=0)
+    # Target resolution should clip action to [0, 1]
+    assert env_long._resolve_target(-0.5) == 0.0
+    assert env_long._resolve_target(0.5) > 0.0
+
+    # Test long_only=False (symmetric)
+    env_sym = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=RiskConfig(long_only=False),
+    )
+    assert env_sym.action_space.low[0] == -1.0
+    env_sym.reset(seed=0)
+    # Target resolution should support negative targets (shorts)
+    assert env_sym._resolve_target(-0.5) < 0.0

@@ -103,6 +103,21 @@ def main():
         default=42,
         help="Global random seed for reproducibility (default: 42).",
     )
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to restrict action space to [0, 1] (long-only). Default is True.",
+    )
+    parser.add_argument(
+        "--checkpoint-selection",
+        choices=("final_epoch", "test_sharpe"),
+        default="final_epoch",
+        help=(
+            "Checkpoint selection rule. final_epoch (default) never inspects the "
+            "test period during training; test_sharpe is legacy exploratory behavior."
+        ),
+    )
     args = parser.parse_args()
 
     # ── Reproducibility ──────────────────────────────────────
@@ -130,19 +145,23 @@ def main():
     df = load_market_data(args.data_path)
     _, test_bound = split_frame_bounds(df, window_size=30, test_start_date=args.test_start_date)
 
-    # Initialize environment in flat_obs mode for validation
-    risk_config = RiskConfig(
-        flat_obs=True,
-        stop_loss_pct=0.05,
-        max_drawdown_pct=0.15,
-        use_trend_features=True,
-    )
-    eval_env = PositionMgmtEnv(
-        df=df,
-        window_size=30,
-        frame_bound=test_bound,
-        risk_config=risk_config,
-    )
+    # Legacy exploratory mode selected checkpoints on the test period. The MVP
+    # defaults to final_epoch so 2024-2026 is not inspected during training.
+    eval_env = None
+    if args.checkpoint_selection == "test_sharpe":
+        risk_config = RiskConfig(
+            flat_obs=True,
+            stop_loss_pct=0.05,
+            max_drawdown_pct=0.15,
+            use_trend_features=True,
+            long_only=args.long_only,
+        )
+        eval_env = PositionMgmtEnv(
+            df=df,
+            window_size=30,
+            frame_bound=test_bound,
+            risk_config=risk_config,
+        )
 
     # Setup dataset to inspect maximum RTG for scaling
     print(f"Loading dataset from {args.dataset}...")
@@ -185,6 +204,7 @@ def main():
         action_dim=1,
         context_length=args.context_length,
         max_episode_len=max_episode_len,
+        action_activation="sigmoid" if args.long_only else "tanh",
     )
 
     print("Starting Decision Transformer training...")
@@ -207,8 +227,12 @@ def main():
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Save checkpoints
-    # Save the best evaluation state dict if it was populated during training
-    state_dict_to_save = getattr(model, "best_state_dict", model.state_dict())
+    # Only legacy test_sharpe mode uses the best test-evaluation checkpoint.
+    state_dict_to_save = (
+        getattr(model, "best_state_dict", model.state_dict())
+        if args.checkpoint_selection == "test_sharpe"
+        else model.state_dict()
+    )
     
     checkpoint = {
         "state_dict": state_dict_to_save,
@@ -219,11 +243,14 @@ def main():
         "state_dim": state_dim,
         "max_episode_len": max_episode_len,
         "seed": args.seed,
+        "action_activation": "sigmoid" if args.long_only else "tanh",
+        "long_only": args.long_only,
+        "selection_rule": args.checkpoint_selection,
     }
 
     checkpoint_file = output_path / "dt_model.pt"
     torch.save(checkpoint, checkpoint_file)
-    print(f"Saved best model checkpoint to {checkpoint_file}")
+    print(f"Saved {args.checkpoint_selection} model checkpoint to {checkpoint_file}")
 
     # Save training history
     history_file = output_path / "history.pkl"

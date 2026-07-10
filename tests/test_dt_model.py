@@ -8,6 +8,7 @@ import pytest
 
 from rl_stock.dt_model import DecisionTransformer
 from rl_stock.dt_inference import DTAgent, evaluate_dt_model
+from rl_stock.bc_model import BehaviorCloning
 from rl_stock.envs_v2 import PositionMgmtEnv, RiskConfig
 
 
@@ -56,6 +57,49 @@ class TestDecisionTransformerModel:
         assert pred.shape == (batch, K, 1)
         # Ensure outputs are finite and valid
         assert torch.isfinite(pred).all()
+
+    def test_long_only_predictions_are_bounded(self):
+        model = DecisionTransformer(
+            state_dim=4,
+            action_dim=1,
+            d_model=16,
+            n_heads=2,
+            n_layers=1,
+            context_length=3,
+            action_activation="sigmoid",
+        )
+        pred = model(
+            states=torch.randn(2, 3, 4),
+            actions=torch.rand(2, 3, 1),
+            rtgs=torch.randn(2, 3, 1),
+            timesteps=torch.zeros(2, 3, dtype=torch.long),
+        )
+        assert torch.all(pred >= 0.0)
+        assert torch.all(pred <= 1.0)
+
+    def test_invalid_action_activation_rejected(self):
+        with pytest.raises(ValueError, match="action_activation"):
+            DecisionTransformer(state_dim=4, action_activation="relu")
+
+
+@pytest.mark.unit
+def test_long_only_bc_predictions_are_bounded():
+    model = BehaviorCloning(
+        state_dim=4,
+        action_dim=1,
+        d_model=16,
+        n_heads=2,
+        n_layers=1,
+        context_length=3,
+        action_activation="sigmoid",
+    )
+    pred = model(
+        states=torch.randn(2, 3, 4),
+        actions=torch.rand(2, 3, 1),
+        timesteps=torch.zeros(2, 3, dtype=torch.long),
+    )
+    assert torch.all(pred >= 0.0)
+    assert torch.all(pred <= 1.0)
 
 
 @pytest.mark.unit

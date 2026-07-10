@@ -22,12 +22,23 @@ class BehaviorCloning(nn.Module):
         context_length: int = 20,
         dropout: float = 0.1,
         max_episode_len: int = 2048,
+        action_activation: str = "tanh",
     ):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.d_model = d_model
         self.context_length = context_length
+        self.action_activation = action_activation
+
+        if action_activation == "sigmoid":
+            output_activation: nn.Module = nn.Sigmoid()
+        elif action_activation == "tanh":
+            output_activation = nn.Tanh()
+        else:
+            raise ValueError(
+                "action_activation must be 'sigmoid' (long-only) or 'tanh' (symmetric)"
+            )
 
         # Embedding layers (no embed_rtg)
         self.embed_state = nn.Linear(state_dim, d_model)
@@ -57,7 +68,7 @@ class BehaviorCloning(nn.Module):
             nn.Linear(d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, action_dim),
-            nn.Tanh(),  # continuous target is in [-1, 1]
+            output_activation,
         )
 
     def forward(
