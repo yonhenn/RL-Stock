@@ -69,6 +69,12 @@ def main():
         default="2024-01-01",
         help="Date to split train and test (default: 2024-01-01).",
     )
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to restrict action space to [0, 1] (long-only). Default is True.",
+    )
     args = parser.parse_args()
 
     # Load market data
@@ -84,6 +90,7 @@ def main():
         stop_loss_pct=0.05,        # 5% hard stop loss
         max_drawdown_pct=0.15,      # 15% drawdown circuit breaker
         use_trend_features=True,    # Use trend indicators in state
+        long_only=args.long_only,
     )
     
     print("Initializing PositionMgmtEnv in window mode for policy compatibility...")

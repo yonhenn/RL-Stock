@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Max |position| while turbulent (0.0 = flatten the book).",
     )
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to restrict action space to [0, 1] (long-only). Default is True.",
+    )
     return parser.parse_args()
 
 
@@ -173,6 +179,7 @@ def main() -> None:
         turbulence_lookback=args.turbulence_lookback,
         turbulence_threshold=args.turbulence_threshold,
         turbulence_exposure_cap=args.turbulence_exposure_cap,
+        long_only=args.long_only,
     )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 

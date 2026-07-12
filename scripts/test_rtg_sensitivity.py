@@ -70,8 +70,27 @@ def run_dt_eval_with_rtg(agent: DTAgent, env: PositionMgmtEnv, target_rtg: float
 
 
 def main():
-    data_path = ROOT / "nasdaq100.xlsx"
-    dt_ckpt_path = ROOT / "outputs" / "dt" / "dt_model.pt"
+    import argparse
+    parser = argparse.ArgumentParser(description="Run sensitivity analysis on target RTG values.")
+    parser.add_argument("--data-path", type=str, default="nasdaq100.xlsx")
+    parser.add_argument("--dt-checkpoint", type=str, default="outputs/dt/dt_model.pt")
+    parser.add_argument("--test-start-date", type=str, default="2024-01-01")
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to restrict action space to [0, 1] (long-only). Default is True.",
+    )
+    parser.add_argument(
+        "--test-rtgs",
+        type=str,
+        default="-0.5,0.0,0.05,0.3,0.8,1.5,3.0,5.0",
+        help="Comma-separated list of float target RTGs to evaluate.",
+    )
+    args = parser.parse_args()
+
+    data_path = Path(args.data_path)
+    dt_ckpt_path = Path(args.dt_checkpoint)
 
     if not dt_ckpt_path.exists():
         print(f"Error: DT checkpoint not found at {dt_ckpt_path}")
@@ -79,7 +98,7 @@ def main():
 
     # Load market data
     df = load_market_data(data_path)
-    _, test_bound = split_frame_bounds(df, window_size=30, test_start_date="2024-01-01")
+    _, test_bound = split_frame_bounds(df, window_size=30, test_start_date=args.test_start_date)
 
     # Initialize environment in flat mode
     risk_config = RiskConfig(
@@ -87,6 +106,7 @@ def main():
         stop_loss_pct=0.05,
         max_drawdown_pct=0.15,
         use_trend_features=True,
+        long_only=args.long_only,
     )
     env = PositionMgmtEnv(
         df=df,
@@ -115,7 +135,7 @@ def main():
     )
 
     # Target RTG test list
-    test_rtgs = [-0.5, 0.0, 0.05, 0.3, 0.8, 1.5, 3.0, 5.0]
+    test_rtgs = [float(r.strip()) for r in args.test_rtgs.split(",") if r.strip()]
 
     print("=" * 80)
     print(f"{'Target RTG':<12} | {'Profit (%)':<12} | {'Sharpe':<8} | {'Max DD (%)':<12} | {'Satur. (%)':<12} | {'Avg Pos':<8} | {'Stops':<5}")

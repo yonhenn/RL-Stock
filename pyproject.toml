@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rl-stock"
 version = "0.1.0"
-description = "Structured reinforcement-learning trading experiment for Shanghai Index data."
+description = "Offline Decision Transformer and continuous-control baselines for NASDAQ-100 position management."
 requires-python = ">=3.10"
 dependencies = [
     "gym-anytrading",

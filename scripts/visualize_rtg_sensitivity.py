@@ -24,14 +24,35 @@ from scripts.test_rtg_sensitivity import run_dt_eval_with_rtg
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate target RTGs and plot sensitivity results.")
+    parser.add_argument("--data-path", type=str, default="nasdaq100.xlsx")
+    parser.add_argument("--dt-checkpoint", type=str, default="outputs/dt/dt_model.pt")
+    parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--test-start-date", type=str, default="2024-01-01")
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to restrict action space to [0, 1] (long-only). Default is True.",
+    )
+    parser.add_argument(
+        "--test-rtgs",
+        type=str,
+        default="-0.5,0.0,0.3,0.8,1.3,2.4,3.0,5.0",
+        help="Comma-separated list of float target RTGs to evaluate.",
+    )
+    args = parser.parse_args()
+
     configure_matplotlib()
-    data_path = ROOT / "nasdaq100.xlsx"
-    dt_ckpt_path = ROOT / "outputs" / "dt" / "dt_model.pt"
-    output_dir = ROOT / "outputs"
+    data_path = Path(args.data_path)
+    dt_ckpt_path = Path(args.dt_checkpoint)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load market data
     df = load_market_data(data_path)
-    _, test_bound = split_frame_bounds(df, window_size=30, test_start_date="2024-01-01")
+    _, test_bound = split_frame_bounds(df, window_size=30, test_start_date=args.test_start_date)
 
     # Initialize environment
     risk_config = RiskConfig(
@@ -39,6 +60,7 @@ def main():
         stop_loss_pct=0.05,
         max_drawdown_pct=0.15,
         use_trend_features=True,
+        long_only=args.long_only,
     )
     env = PositionMgmtEnv(
         df=df,
@@ -67,7 +89,7 @@ def main():
     )
 
     # Target RTGs to evaluate
-    test_rtgs = [-0.5, 0.0, 0.05, 0.3, 0.8, 1.5, 3.0, 5.0]
+    test_rtgs = [float(r.strip()) for r in args.test_rtgs.split(",") if r.strip()]
     
     profits = []
     sharpes = []

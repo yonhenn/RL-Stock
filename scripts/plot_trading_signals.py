@@ -51,21 +51,40 @@ def detect_signals(positions):
     return buys, sells
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Plot trading signals overlay.")
+    parser.add_argument("--data-path", type=str, default="nasdaq100.xlsx")
+    parser.add_argument("--dt-checkpoint", type=str, default="outputs/dt/dt_model.pt")
+    parser.add_argument("--bc-checkpoint", type=str, default="outputs/bc/bc_model.pt")
+    parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--test-start-date", type=str, default="2024-01-01")
+    parser.add_argument(
+        "--long-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to restrict action space to [0, 1] (long-only). Default is True.",
+    )
+    parser.add_argument("--target-rtg-low", type=float, default=0.3)
+    parser.add_argument("--target-rtg-high", type=float, default=2.4)
+    args = parser.parse_args()
+
     configure_matplotlib()
     
-    data_path = PROJECT_ROOT / "nasdaq100.xlsx"
-    dt_ckpt_path = PROJECT_ROOT / "outputs" / "dt" / "dt_model.pt"
-    bc_ckpt_path = PROJECT_ROOT / "outputs" / "bc" / "bc_model.pt"
-    output_dir = Path("/Users/rickchen/.gemini/antigravity/brain/4b083282-a711-4b21-823e-1218356772a9")
+    data_path = Path(args.data_path)
+    dt_ckpt_path = Path(args.dt_checkpoint)
+    bc_ckpt_path = Path(args.bc_checkpoint)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     df = load_market_data(data_path)
-    _, test_bound = split_frame_bounds(df, window_size=30, test_start_date="2024-01-01")
+    _, test_bound = split_frame_bounds(df, window_size=30, test_start_date=args.test_start_date)
     
     risk_config = RiskConfig(
         flat_obs=True,
         stop_loss_pct=0.05,
         max_drawdown_pct=0.15,
         use_trend_features=True,
+        long_only=args.long_only,
     )
     env = PositionMgmtEnv(df=df, window_size=30, frame_bound=test_bound, risk_config=risk_config)
     
@@ -79,8 +98,8 @@ def main():
     )
     dt_model.load_state_dict(dt_checkpoint["state_dict"])
     
-    dt_agent_03 = DTAgent(dt_model, 0.3, dt_checkpoint["state_mean"], dt_checkpoint["state_std"], dt_checkpoint["rtg_scale"])
-    dt_agent_08 = DTAgent(dt_model, 0.8, dt_checkpoint["state_mean"], dt_checkpoint["state_std"], dt_checkpoint["rtg_scale"])
+    dt_agent_03 = DTAgent(dt_model, args.target_rtg_low, dt_checkpoint["state_mean"], dt_checkpoint["state_std"], dt_checkpoint["rtg_scale"])
+    dt_agent_08 = DTAgent(dt_model, args.target_rtg_high, dt_checkpoint["state_mean"], dt_checkpoint["state_std"], dt_checkpoint["rtg_scale"])
     
     # Load BC
     bc_checkpoint = torch.load(bc_ckpt_path, map_location="cpu", weights_only=False)
@@ -96,9 +115,9 @@ def main():
     # Run evaluations
     print("Running BC Agent...")
     bc_pos, bc_prices = run_agent_history(bc_agent, env)
-    print("Running DT (RTG=0.30) Agent...")
+    print(f"Running DT (RTG={args.target_rtg_low:.2f}) Agent...")
     dt03_pos, dt03_prices = run_agent_history(dt_agent_03, env)
-    print("Running DT (RTG=0.80) Agent...")
+    print(f"Running DT (RTG={args.target_rtg_high:.2f}) Agent...")
     dt08_pos, dt08_prices = run_agent_history(dt_agent_08, env)
     
     # Detect buy/sell ticks
@@ -112,8 +131,8 @@ def main():
     
     configs = [
         ("Behavior Cloning (BC - No RTG)", bc_prices, bc_pos, bc_buys, bc_sells, axes[0], "#ff7f0e"),
-        ("Decision Transformer (DT - RTG = 0.30)", dt03_prices, dt03_pos, dt03_buys, dt03_sells, axes[1], "#aec7e8"),
-        ("Decision Transformer (DT - RTG = 0.80 - Sweet Spot)", dt08_prices, dt08_pos, dt08_buys, dt08_sells, axes[2], "#1f77b4")
+        (f"Decision Transformer (DT - RTG = {args.target_rtg_low:.2f})", dt03_prices, dt03_pos, dt03_buys, dt03_sells, axes[1], "#aec7e8"),
+        (f"Decision Transformer (DT - RTG = {args.target_rtg_high:.2f} - Sweet Spot)", dt08_prices, dt08_pos, dt08_buys, dt08_sells, axes[2], "#1f77b4")
     ]
     
     for title, prices, positions, buys, sells, ax, model_color in configs:
@@ -137,7 +156,10 @@ def main():
         ax2.fill_between(dates, 0, positions, color=model_color, alpha=0.1)
         ax2.set_ylabel("Target Position Ratio", color=model_color, fontsize=11)
         ax2.tick_params(axis="y", labelcolor=model_color)
-        ax2.set_ylim(-1.1, 1.1)
+        if args.long_only:
+            ax2.set_ylim(-0.05, 1.05)
+        else:
+            ax2.set_ylim(-1.1, 1.1)
         ax2.axhline(0, color="gray", linestyle="-", linewidth=0.5, alpha=0.5)
         
     plt.xlabel("Date", fontsize=12)
