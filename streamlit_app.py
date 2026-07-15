@@ -6,9 +6,9 @@ Run with::
 
 Two pages (switch in the sidebar):
 
-- **算法收益对比 / Compare**: per-experiment saved metrics plus a live equity
+- **Algorithm Comparison**: per-experiment saved metrics plus a live equity
   replay of every algorithm.
-- **买卖点分析 / Trades**: the raw NASDAQ-100 price with buy/sell markers, a
+- **Trade Analysis**: the raw NASDAQ-100 price with buy/sell markers, a
   cumulative-return comparison, position ribbons, and holding-time stats for any
   mix of experiment x algorithm combinations, overlaid on shared charts.
 """
@@ -27,18 +27,17 @@ if str(SRC) not in sys.path:
 
 from rl_stock.dashboard import page_compare, page_trades  # noqa: E402
 
-st.set_page_config(page_title="RL 算法收益对比", page_icon="📈", layout="wide")
+st.set_page_config(page_title="RL Trading Dashboard", layout="wide")
 
 navigation = st.navigation(
     [
         st.Page(
             page_compare.render,
-            title="算法收益对比 Compare",
-            icon="📈",
+            title="Algorithm Comparison",
             url_path="compare",
             default=True,
         ),
-        st.Page(page_trades.render, title="买卖点分析 Trades", icon="🎯", url_path="trades"),
+        st.Page(page_trades.render, title="Trade Analysis", url_path="trades"),
     ]
 )
 navigation.run()

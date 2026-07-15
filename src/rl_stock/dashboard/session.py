@@ -7,6 +7,8 @@ import streamlit as st
 from rl_stock.dashboard.replay import EnvSettings, ReplayResult, replay_run
 from rl_stock.dashboard.runs import RunInfo
 
+_REPLAY_CACHE_VERSION = 2
+
 
 def _model_mtimes(run: RunInfo) -> tuple[tuple[str, float], ...]:
     """Stable cache key: each model path with its modification time."""
@@ -21,7 +23,7 @@ def cached_replay(run: RunInfo, settings: EnvSettings) -> ReplayResult:
     the same curves instead of reloading torch models every rerun.
     """
     cache: dict[str, ReplayResult] = st.session_state.setdefault("_equity_cache", {})
-    key = f"{run.path}|{_model_mtimes(run)}|{settings}"
+    key = f"v{_REPLAY_CACHE_VERSION}|{run.path}|{_model_mtimes(run)}|{settings}"
     if key not in cache:
         cache[key] = replay_run(run, settings)
     return cache[key]

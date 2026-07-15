@@ -18,8 +18,17 @@ from rl_stock.dashboard.figures import (
     derive_trades,
     trade_stats,
 )
-from rl_stock.dashboard.replay import infer_env_flags
-from rl_stock.dashboard.runs import discover_runs, parse_summary_csv
+from rl_stock.dashboard.page_trades import _algorithms_in, _pairs
+from rl_stock.dashboard.replay import (
+    BASELINE_STRATEGIES,
+    BUY_AND_HOLD_LABEL,
+    BUY_AT_DIP_LABEL,
+    RANDOM_LABEL,
+    _buy_and_hold_paths,
+    _buy_at_dip_paths,
+    infer_env_flags,
+)
+from rl_stock.dashboard.runs import RunInfo, discover_runs, parse_summary_csv
 
 _SUMMARY = (
     "Strategy,Average Profit,Return Rate,Highest,Lowest,Standard Deviation,Sharpe,Max DD,Calmar\n"
@@ -108,6 +117,23 @@ def test_discover_runs_missing_dir_returns_empty(tmp_path: Path):
     assert discover_runs(tmp_path / "does-not-exist") == []
 
 
+@pytest.mark.unit
+def test_trade_view_appends_requested_baselines_to_trained_algorithms(tmp_path: Path):
+    run = RunInfo(
+        label="position_trend",
+        path=tmp_path,
+        summary_path=tmp_path / "summary.csv",
+        model_paths=(("PPO", tmp_path / "ppo.zip"), ("SAC", tmp_path / "sac.zip")),
+        returns_png=None,
+    )
+
+    available = _algorithms_in([run])
+
+    assert available == ["PPO", "SAC", *BASELINE_STRATEGIES]
+    assert BASELINE_STRATEGIES == (BUY_AT_DIP_LABEL, RANDOM_LABEL, BUY_AND_HOLD_LABEL)
+    assert [algo for _, algo in _pairs([run], available)] == available
+
+
 # --------------------------------------------------------------------------- #
 # infer_env_flags
 # --------------------------------------------------------------------------- #
@@ -129,6 +155,38 @@ def test_infer_env_flags_known_widths(width: int, trend: bool, turb: bool):
 @pytest.mark.unit
 def test_infer_env_flags_unknown_width_returns_none():
     assert infer_env_flags(23) is None
+
+
+# --------------------------------------------------------------------------- #
+# Trade-view baseline paths
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_buy_and_hold_paths_track_the_price_ratio():
+    index = pd.date_range("2024-01-01", periods=3, freq="D")
+    price = pd.Series([100.0, 105.0, 110.0], index=index)
+
+    equity, positions = _buy_and_hold_paths(price, initial_cash=1_000.0)
+
+    assert equity.tolist() == pytest.approx([1_000.0, 1_050.0, 1_100.0])
+    assert positions.tolist() == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.unit
+def test_buy_at_dip_enters_below_average_and_exits_on_recovery():
+    index = pd.date_range("2024-01-01", periods=22, freq="D")
+    price = pd.Series([100.0] * 19 + [95.0, 96.0, 100.0], index=index)
+
+    equity, positions = _buy_at_dip_paths(
+        price,
+        initial_cash=1_000.0,
+        trade_fee_rate=0.001,
+    )
+
+    assert positions.iloc[:19].eq(0.0).all()
+    assert positions.iloc[19:21].eq(1.0).all()
+    assert positions.iloc[21] == 0.0
+    assert equity.iloc[19] == pytest.approx(999.0)  # entry fee
+    assert equity.iloc[-1] > equity.iloc[19]
 
 
 # --------------------------------------------------------------------------- #
@@ -155,13 +213,19 @@ def test_derive_trades_counts_open_position_at_end():
 
 @pytest.mark.unit
 def test_trade_stats_summarizes_each_combo():
+    label = "regime_study / SAC"
     position = pd.Series([0.0, 0.5, 0.5, 0.0])
-    stats = trade_stats([("regime_study · SAC", position)], {"regime_study · SAC": 7.6})
+    cumulative_return = pd.Series([0.0, 5.0, -10.0, 7.6])
+    stats = trade_stats([(label, position)], {label: cumulative_return})
     row = stats.iloc[0]
-    assert row["买入次数 Buys"] == 1
-    assert row["卖出次数 Sells"] == 1
-    assert row["最终收益 Return"] == "+7.60%"
-    assert row["持仓占比 In-market"] == "50%"
+    assert row["Buys"] == 1
+    assert row["Sells"] == 1
+    assert row["Return"] == "+7.60%"
+    assert row["Max Drawdown"] == "14.29%"
+    assert float(row["Sharpe"]) == pytest.approx(3.201, abs=0.001)
+    assert float(row["Sortino"]) == pytest.approx(3.804, abs=0.001)
+    assert float(row["Calmar"]) == pytest.approx(60.387, abs=0.001)
+    assert row["Time in Market"] == "50%"
 
 
 # --------------------------------------------------------------------------- #
@@ -171,8 +235,8 @@ def test_trade_stats_summarizes_each_combo():
 def test_cumulative_return_lines_one_trace_per_combo_with_matched_colours():
     idx = pd.date_range("2024-01-01", periods=3, freq="D")
     combos = [
-        ("regime_study · PPO", pd.Series([0.0, 1.5, 3.2], index=idx)),
-        ("regime_study · SAC", pd.Series([0.0, -0.5, 2.1], index=idx)),
+        ("regime_study / PPO", pd.Series([0.0, 1.5, 3.2], index=idx)),
+        ("regime_study / SAC", pd.Series([0.0, -0.5, 2.1], index=idx)),
     ]
 
     fig = cumulative_return_lines(combos)

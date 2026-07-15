@@ -35,6 +35,16 @@ _OBS_WIDTH_TO_FLAGS: dict[int, dict[str, bool]] = {
 }
 
 RANDOM_LABEL = "Random"
+BUY_AT_DIP_LABEL = "Buy at the Dip"
+BUY_AND_HOLD_LABEL = "Buy and Hold"
+
+# Rule-based baselines shown alongside the trained RL models on the trade page.
+# Keep this order in sync with the requested selector order.
+BASELINE_STRATEGIES: tuple[str, ...] = (
+    BUY_AT_DIP_LABEL,
+    RANDOM_LABEL,
+    BUY_AND_HOLD_LABEL,
+)
 
 
 class ReplayUnavailable(RuntimeError):
@@ -175,11 +185,97 @@ def _price_series(env) -> pd.Series:
     return pd.Series(prices, index=dates, name="NASDAQ-100")
 
 
+def _buy_and_hold_paths(
+    price: pd.Series, initial_cash: float
+) -> tuple[pd.Series, pd.Series]:
+    """Return equity and full-long position paths for a buy-and-hold baseline."""
+    values = price.to_numpy(dtype=float)
+    if values.size == 0 or not np.isfinite(values[0]) or values[0] <= 0:
+        empty = pd.Series(index=price.index, dtype=float)
+        return empty.rename(BUY_AND_HOLD_LABEL), empty.copy().rename(BUY_AND_HOLD_LABEL)
+
+    equity = initial_cash * values / values[0]
+    positions = np.ones(values.size, dtype=float)
+    return (
+        pd.Series(equity, index=price.index, name=BUY_AND_HOLD_LABEL),
+        pd.Series(positions, index=price.index, name=BUY_AND_HOLD_LABEL),
+    )
+
+
+def _buy_at_dip_paths(
+    price: pd.Series,
+    initial_cash: float,
+    trade_fee_rate: float,
+    *,
+    lookback: int = 20,
+    entry_discount: float = 0.02,
+) -> tuple[pd.Series, pd.Series]:
+    """Return paths for a simple causal buy-the-dip benchmark.
+
+    The strategy enters a full-long position when the close is at least 2%
+    below its trailing 20-day moving average, holds through the dip, and exits
+    when the close recovers to that moving average.  Trades are charged the same
+    proportional fee configured for the replay environment.
+    """
+    if lookback < 2:
+        raise ValueError("lookback must be at least 2")
+    if not 0.0 <= entry_discount < 1.0:
+        raise ValueError("entry_discount must be in [0, 1)")
+    if not 0.0 <= trade_fee_rate < 1.0:
+        raise ValueError("trade_fee_rate must be in [0, 1)")
+
+    values = price.to_numpy(dtype=float)
+    equity_values = np.full(values.size, float(initial_cash), dtype=float)
+    position_values = np.zeros(values.size, dtype=float)
+    if values.size == 0:
+        return (
+            pd.Series(equity_values, index=price.index, name=BUY_AT_DIP_LABEL),
+            pd.Series(position_values, index=price.index, name=BUY_AT_DIP_LABEL),
+        )
+
+    trailing_mean = (
+        pd.Series(values)
+        .rolling(window=lookback, min_periods=lookback)
+        .mean()
+        .to_numpy(dtype=float)
+    )
+    equity = float(initial_cash)
+    position = 0.0
+
+    for i, current_price in enumerate(values):
+        # Mark the position to market before deciding whether to trade at the
+        # current close. This keeps the rule causal and the dates intuitive.
+        if i > 0 and np.isfinite(current_price) and values[i - 1] > 0:
+            price_return = current_price / values[i - 1] - 1.0
+            equity *= 1.0 + position * price_return
+
+        target = position
+        reference = trailing_mean[i]
+        if np.isfinite(current_price) and np.isfinite(reference) and reference > 0:
+            if position == 0.0 and current_price <= reference * (1.0 - entry_discount):
+                target = 1.0
+            elif position > 0.0 and current_price >= reference:
+                target = 0.0
+
+        turnover = abs(target - position)
+        if turnover:
+            equity *= 1.0 - turnover * trade_fee_rate
+        position = target
+        equity_values[i] = equity
+        position_values[i] = position
+
+    return (
+        pd.Series(equity_values, index=price.index, name=BUY_AT_DIP_LABEL),
+        pd.Series(position_values, index=price.index, name=BUY_AT_DIP_LABEL),
+    )
+
+
 def replay_run(run: RunInfo, settings: EnvSettings) -> ReplayResult:
     """Reload every model in ``run`` and reconstruct their equity/position paths.
 
-    Also replays the random baseline on the same environment and captures the
-    underlying price series, so callers can overlay trades on the raw index.
+    Also builds Random, Buy at the Dip, and Buy and Hold baselines and captures
+    the underlying price series, so callers can overlay every strategy's trades
+    on the raw index.
 
     Raises:
         ReplayUnavailable: if the run has no models, the environment feature set
@@ -233,6 +329,18 @@ def replay_run(run: RunInfo, settings: EnvSettings) -> ReplayResult:
     equity_curves[RANDOM_LABEL] = _dated_series(env, info["equity_curve"], RANDOM_LABEL)
     position_curves[RANDOM_LABEL] = _dated_series(env, info["position_history"], RANDOM_LABEL)
     price = _price_series(env)
+
+    dip_equity, dip_positions = _buy_at_dip_paths(
+        price,
+        settings.initial_cash,
+        settings.trade_fee_rate,
+    )
+    equity_curves[BUY_AT_DIP_LABEL] = dip_equity
+    position_curves[BUY_AT_DIP_LABEL] = dip_positions
+
+    hold_equity, hold_positions = _buy_and_hold_paths(price, settings.initial_cash)
+    equity_curves[BUY_AND_HOLD_LABEL] = hold_equity
+    position_curves[BUY_AND_HOLD_LABEL] = hold_positions
 
     for algo, model in models.items():
         env = _build_env(settings.data_path, settings, flags)

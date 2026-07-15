@@ -11,6 +11,14 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
+from rl_stock.risk import (
+    EPS,
+    compute_calmar_ratio,
+    compute_max_drawdown,
+    compute_sharpe_ratio,
+    compute_sortino_ratio,
+)
+
 # A position below this ratio counts as "flat" for trade-event detection.
 POSITION_EPS = 1e-3
 
@@ -223,6 +231,12 @@ def price_with_trades(price: pd.Series, combos: list[tuple[str, pd.Series]]) -> 
     marker *fill* = action (green buy / red sell), marker *outline* = algorithm
     colour (matched to the position chart), marker *shape* = combo identity.
     ``combos`` is an ordered ``(label, position_series)`` list.
+
+    A green *buy* marks opening a position from flat; a red *sell* marks the
+    position being fully closed back to flat (exposure returns to 0). These are
+    full entry/exit events, not the daily rebalancing in between, so a stretch
+    where the position drifts between (say) 0.2 and 1.0 without touching flat
+    carries no markers even though exposure is changing every day.
     """
     fig = go.Figure()
     fig.add_trace(
@@ -232,12 +246,17 @@ def price_with_trades(price: pd.Series, combos: list[tuple[str, pd.Series]]) -> 
             mode="lines",
             name=price.name or "NASDAQ-100",
             line=dict(color="#9AA0A6", width=1.6),
-            hovertemplate="%{x|%Y-%m-%d}<br>价格 %{y:.0f}<extra></extra>",
+            hovertemplate="%{x|%Y-%m-%d}<br>Price %{y:.0f}<extra></extra>",
         )
     )
 
-    # Action legend (fill colour): what green vs red means.
-    for name, fill in (("买入 Buy", BUY_COLOR), ("卖出 Sell", SELL_COLOR)):
+    # Action legend (fill colour): what green vs red means. A buy opens a
+    # position from flat; a sell means the position is fully closed back to
+    # flat (a full exit, not a partial trim), so the labels spell that out.
+    for name, fill in (
+        ("Buy: enter from flat", BUY_COLOR),
+        ("Sell: fully close to flat", SELL_COLOR),
+    ):
         fig.add_trace(
             go.Scatter(
                 x=[None], y=[None], mode="markers", name=name, legendgroup="_action",
@@ -263,9 +282,9 @@ def price_with_trades(price: pd.Series, combos: list[tuple[str, pd.Series]]) -> 
             )
         )
 
-        for action, fill, dates in (
-            ("买入", BUY_COLOR, trades["buys"]),
-            ("卖出", SELL_COLOR, trades["sells"]),
+        for action, meaning, fill, dates in (
+            ("Buy", "enter from flat", BUY_COLOR, trades["buys"]),
+            ("Sell", "position fully closed to flat", SELL_COLOR, trades["sells"]),
         ):
             if not dates:
                 continue
@@ -281,16 +300,24 @@ def price_with_trades(price: pd.Series, combos: list[tuple[str, pd.Series]]) -> 
                         line=dict(color=algo_color, width=1.4),
                     ),
                     hovertemplate=(
-                        f"<b>{label}</b> {action}<br>%{{x|%Y-%m-%d}}<br>%{{y:.0f}}<extra></extra>"
+                        f"<b>{label}</b> {action} ({meaning})"
+                        "<br>%{x|%Y-%m-%d}<br>%{y:.0f}<extra></extra>"
                     ),
                 )
             )
 
     fig.update_layout(
-        title="NASDAQ-100 价格与买卖点 · 绿=买 红=卖，描边色/形状=算法",
-        yaxis_title="指数价格 Price",
+        title=dict(
+            text=(
+                "NASDAQ-100 Price with Buy/Sell Points"
+                "<br><sub>green = Buy (enter from flat) &nbsp;·&nbsp; "
+                "red = Sell (position fully closed back to flat, i.e. a full exit "
+                "to 0 - not a partial trim)</sub>"
+            ),
+        ),
+        yaxis_title="Index Price",
         template="plotly_white",
-        margin=dict(l=10, r=10, t=50, b=90),
+        margin=dict(l=10, r=10, t=72, b=90),
         height=560,
         hovermode="closest",
         legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="left", x=0),
@@ -309,12 +336,12 @@ def position_lines(combos: list[tuple[str, pd.Series]]) -> go.Figure:
                 mode="lines",
                 name=label,
                 line=dict(color=combo_color(index), width=1.6),
-                hovertemplate=f"<b>{label}</b><br>%{{x|%Y-%m-%d}}<br>仓位 %{{y:.2f}}<extra></extra>",
+                hovertemplate=f"<b>{label}</b><br>%{{x|%Y-%m-%d}}<br>Position %{{y:.2f}}<extra></extra>",
             )
         )
     fig.update_layout(
-        title="持仓比例 Position ratio over time",
-        yaxis_title="仓位 Position (0-1)",
+        title="Position Ratio Over Time",
+        yaxis_title="Position (0-1)",
         template="plotly_white",
         margin=dict(l=10, r=10, t=50, b=70),
         height=340,
@@ -345,13 +372,13 @@ def cumulative_return_lines(combos: list[tuple[str, pd.Series]]) -> go.Figure:
                 name=label,
                 line=dict(color=combo_color(index), width=1.8),
                 hovertemplate=f"<b>{label}</b><br>%{{x|%Y-%m-%d}}<br>"
-                "累计收益 %{y:+.2f}%<extra></extra>",
+                "Cumulative return %{y:+.2f}%<extra></extra>",
             )
         )
     fig.add_hline(y=0.0, line_dash="dash", line_color="rgba(0,0,0,0.35)")
     fig.update_layout(
-        title="累计收益对比 Cumulative return by combo (%)",
-        yaxis_title="累计收益 Cumulative return (%)",
+        title="Cumulative Return by Selection (%)",
+        yaxis_title="Cumulative Return (%)",
         template="plotly_white",
         margin=dict(l=10, r=10, t=50, b=70),
         height=420,
@@ -361,23 +388,70 @@ def cumulative_return_lines(combos: list[tuple[str, pd.Series]]) -> go.Figure:
     return fig
 
 
-def trade_stats(combos: list[tuple[str, pd.Series]], finals: dict[str, float]) -> pd.DataFrame:
-    """Per-combo trade summary: counts, holding time, time-in-market, final return."""
+def _formatted_percent(value: float, *, signed: bool = False) -> str:
+    """Format a percentage metric for the summary table."""
+    if not np.isfinite(value):
+        return "-"
+    return f"{value:+.2f}%" if signed else f"{value:.2f}%"
+
+
+def _formatted_ratio(value: float) -> str:
+    """Format a unitless risk ratio for the summary table."""
+    return "-" if not np.isfinite(value) else f"{value:.3f}"
+
+
+def trade_stats(
+    combos: list[tuple[str, pd.Series]],
+    cumulative_returns: dict[str, pd.Series],
+) -> pd.DataFrame:
+    """Per-combo trading activity plus return and risk metrics.
+
+    ``cumulative_returns`` contains cumulative percentage-point return paths
+    keyed by the same labels as ``combos``. They are converted back to a
+    normalized equity curve so Max DD, Sharpe, Sortino, and Calmar use the same
+    definitions as the training summary.
+    """
     rows: list[dict] = []
     for label, position in combos:
         trades = derive_trades(position)
         holding = trades["holding_days"]
         held_days = int((position.to_numpy(dtype=float) > POSITION_EPS).sum())
         total_days = int(len(position))
+
+        cumulative = cumulative_returns.get(label, pd.Series(dtype=float))
+        cumulative = (
+            pd.to_numeric(cumulative, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if cumulative.empty:
+            final_return = max_drawdown = sharpe = sortino = calmar = float("nan")
+        else:
+            equity = 1.0 + cumulative.to_numpy(dtype=float) / 100.0
+            period_returns = np.diff(equity) / np.maximum(equity[:-1], EPS)
+            final_return = float(cumulative.iloc[-1])
+            max_drawdown = compute_max_drawdown(equity) * 100.0
+            sharpe = compute_sharpe_ratio(period_returns)
+            sortino = compute_sortino_ratio(period_returns)
+            calmar = compute_calmar_ratio(period_returns, equity)
+
         rows.append(
             {
-                "参数组合 Combo": label,
-                "买入次数 Buys": len(trades["buys"]),
-                "卖出次数 Sells": len(trades["sells"]),
-                "平均持有(天) Avg hold": round(float(np.mean(holding)), 1) if holding else 0.0,
-                "最长持有(天) Max hold": max(holding) if holding else 0,
-                "持仓占比 In-market": f"{(held_days / total_days * 100) if total_days else 0:.0f}%",
-                "最终收益 Return": f"{finals.get(label, float('nan')):+.2f}%",
+                "Selection": label,
+                "Return": _formatted_percent(final_return, signed=True),
+                "Max Drawdown": _formatted_percent(max_drawdown),
+                "Sharpe": _formatted_ratio(sharpe),
+                "Sortino": _formatted_ratio(sortino),
+                "Calmar": _formatted_ratio(calmar),
+                "Buys": len(trades["buys"]),
+                "Sells": len(trades["sells"]),
+                "Average Holding (days)": (
+                    round(float(np.mean(holding)), 1) if holding else 0.0
+                ),
+                "Longest Holding (days)": max(holding) if holding else 0,
+                "Time in Market": (
+                    f"{(held_days / total_days * 100) if total_days else 0:.0f}%"
+                ),
             }
         )
     return pd.DataFrame(rows)

@@ -1,9 +1,7 @@
 """Page: buy/sell points and holding time on the raw NASDAQ-100 curve.
 
-One shared price line, with any number of parameter combinations overlaid as
-buy/sell markers plus position ribbons. Experiment and algorithm are chosen on
-separate axes, so the same algorithm can be compared across experiments and vice
-versa; every existing (experiment, algorithm) pair becomes one overlaid combo.
+One experiment and one trained or rule-based strategy are selected at a time;
+their buy/sell markers and position path are shown on the raw price curve.
 """
 
 from __future__ import annotations
@@ -19,23 +17,35 @@ from rl_stock.dashboard.figures import (
     price_with_trades,
     trade_stats,
 )
-from rl_stock.dashboard.replay import RANDOM_LABEL, EnvSettings, ReplayUnavailable
+from rl_stock.dashboard.replay import (
+    BASELINE_STRATEGIES,
+    BUY_AT_DIP_LABEL,
+    EnvSettings,
+    ReplayUnavailable,
+)
 from rl_stock.dashboard.runs import KNOWN_ALGORITHMS, RunInfo, discover_runs
 from rl_stock.dashboard.session import cached_replay
 
-_COMBO_SEP = " · "
+_COMBO_SEP = " / "
+_DEFAULT_EXPERIMENT = "position_trend"
+_DEFAULT_ALGORITHM = "PPO"
 
 
 def _sidebar() -> tuple[list[RunInfo], EnvSettings]:
     """Data-source and env controls; returns discovered runs and replay settings."""
-    st.sidebar.header("买卖点分析 Trade view")
-    outputs_dir = st.sidebar.text_input("outputs 目录", value="outputs")
-    data_path = st.sidebar.text_input("数据文件 Data path", value="nasdaq100.xlsx")
-    test_start = st.sidebar.text_input("测试起始日 Test start", value="2024-01-01")
-    with st.sidebar.expander("高级：训练时的环境设置"):
-        st.caption("如某实验训练时启用过残差趋势先验 / regime 限仓，勾选以精确复现其买卖行为。")
-        use_prior = st.checkbox("残差趋势先验 use_trend_prior", value=False)
-        use_regime = st.checkbox("regime限仓 regime_risk_scaling", value=False)
+    st.sidebar.header("Trade Analysis")
+    outputs_dir = st.sidebar.text_input("Outputs directory", value="outputs")
+    data_path = st.sidebar.text_input("Data file", value="nasdaq100.xlsx")
+    test_start = st.sidebar.text_input("Test start date", value="2024-01-01")
+    with st.sidebar.expander("Advanced: training environment settings"):
+        st.caption(
+            "Enable these settings if the selected run used a residual trend prior or "
+            "regime position limits during training."
+        )
+        use_prior = st.checkbox("Residual trend prior (use_trend_prior)", value=False)
+        use_regime = st.checkbox(
+            "Regime position limits (regime_risk_scaling)", value=False
+        )
 
     settings = EnvSettings(
         data_path=Path(data_path),
@@ -47,9 +57,12 @@ def _sidebar() -> tuple[list[RunInfo], EnvSettings]:
 
 
 def _algorithms_in(experiments: list[RunInfo]) -> list[str]:
-    """Union of algorithms across the selected experiments, in canonical order."""
+    """Available trained algorithms followed by the rule-based baselines."""
     present = {algo for run in experiments for algo, _ in run.model_paths}
-    return [algo for algo in KNOWN_ALGORITHMS if algo in present]
+    if not present:
+        return []
+    trained = [algo for algo in KNOWN_ALGORITHMS if algo in present]
+    return [*trained, *BASELINE_STRATEGIES]
 
 
 def _pairs(experiments: list[RunInfo], algorithms: list[str]) -> list[tuple[RunInfo, str]]:
@@ -58,7 +71,7 @@ def _pairs(experiments: list[RunInfo], algorithms: list[str]) -> list[tuple[RunI
     for run in experiments:
         run_algos = {algo for algo, _ in run.model_paths}
         for algo in algorithms:
-            if algo in run_algos:
+            if algo in run_algos or algo in BASELINE_STRATEGIES:
                 pairs.append((run, algo))
     return pairs
 
@@ -85,14 +98,14 @@ def _collect(
             continue
         if run.label not in results:
             try:
-                with st.spinner(f"回放 {run.label} …"):
+                with st.spinner(f"Replaying {run.label}..."):
                     results[run.label] = cached_replay(run, settings)
             except ReplayUnavailable as exc:
-                st.warning(f"{run.label}: 无法回放买卖点（{exc}）")
+                st.warning(f"{run.label}: trade replay is unavailable ({exc})")
                 failed.add(run.label)
                 continue
             except Exception as exc:  # noqa: BLE001 - surface any load/replay error
-                st.error(f"{run.label}: 回放失败 {type(exc).__name__}: {exc}")
+                st.error(f"{run.label}: replay failed: {type(exc).__name__}: {exc}")
                 failed.add(run.label)
                 continue
 
@@ -110,64 +123,82 @@ def _collect(
 
 def render() -> None:
     """Entry point used by the multipage router."""
-    st.title("🎯 买卖点分析 Buy/Sell & holding on the raw NASDAQ-100")
+    st.title("Buy/Sell & Holding Analysis on the Raw NASDAQ-100")
     st.caption(
-        "在原始 NASDAQ-100 价格曲线上叠加不同【实验】与【算法】组合的买点、卖点与持仓时间。"
-        "实验与算法分开选，可同实验比算法、也可同算法比实验，所有存在的组合会叠在同一张图中。"
-        "连续仓位环境下：仓位由 0 变为持有=买入，回到 0=卖出，连续持有天数=持有时间。"
+        "Display buy/sell points and holding periods for the selected experiment and "
+        "algorithm (or baseline) on the raw NASDAQ-100 price curve. In a continuous-"
+        "position environment, moving from zero to a positive position is a buy, "
+        "returning to zero is a sell, and the uninterrupted interval is the holding period."
     )
 
     runs, settings = _sidebar()
     if not runs:
-        st.error("未找到任何实验目录，请先运行 `python train.py`。")
+        st.error("No experiment directories were found. Run `python train.py` first.")
         return
 
     run_by_label = {run.label: run for run in runs}
-
-    # Axis 1: experiments (runs are discovered richest-first, so the default leads).
-    exp_labels = list(run_by_label)
-    experiments = st.multiselect("实验 Experiments", exp_labels, default=exp_labels[:1])
-    if not experiments:
-        st.info("请至少选择一个实验。")
-        return
-    selected_runs = [run_by_label[label] for label in experiments]
+    experiment_labels = list(run_by_label)
+    experiment_index = (
+        experiment_labels.index(_DEFAULT_EXPERIMENT)
+        if _DEFAULT_EXPERIMENT in run_by_label
+        else 0
+    )
+    experiment = st.selectbox(
+        "Experiment",
+        experiment_labels,
+        index=experiment_index,
+    )
+    selected_runs = [run_by_label[experiment]]
 
     # Axis 2: algorithms available across the chosen experiments.
     available = _algorithms_in(selected_runs)
     if not available:
-        st.info("所选实验没有可回放的算法模型。")
+        st.info("The selected experiment has no replayable algorithm models.")
         return
-    algo_default = [a for a in available if a in ("SAC", "PPO")] or available
-    algorithms = st.multiselect("算法 Algorithms", available, default=algo_default)
-    if not algorithms:
-        st.info("请至少选择一个算法。")
-        return
+    algorithm_index = (
+        available.index(_DEFAULT_ALGORITHM)
+        if _DEFAULT_ALGORITHM in available
+        else 0
+    )
+    algorithm = st.selectbox("Algorithm", available, index=algorithm_index)
+    st.caption(
+        f"{BUY_AT_DIP_LABEL}: buy when the close is 2% below its 20-day moving average "
+        "and sell when it recovers to that average. Random uses random positions; "
+        "Buy and Hold remains fully invested."
+    )
 
-    pairs = _pairs(selected_runs, algorithms)
+    pairs = _pairs(selected_runs, [algorithm])
     if not pairs:
-        st.info("所选实验与算法没有交集，请调整选择。")
+        st.info("The selected experiment and algorithm do not form a valid combination.")
         return
 
     price, combos, returns = _collect(pairs, settings)
     if price is None or not combos:
-        st.info("所选组合均无法回放（离散 T+1 实验暂不支持买卖点），请换一组。")
+        st.info(
+            "The selected combination cannot be replayed. Trade markers are not yet "
+            "supported for the discrete T+1 environment."
+        )
         return
 
-    span = f"{price.index.min():%Y-%m-%d} … {price.index.max():%Y-%m-%d}"
-    st.caption(
-        f"共 {len(combos)} 个组合 · 测试区间 Test window: {span}"
-        f"（{RANDOM_LABEL} 基准未纳入买卖点对比）"
+    span = f"{price.index.min():%Y-%m-%d} to {price.index.max():%Y-%m-%d}"
+    st.caption(f"{len(combos)} selection - Test window: {span}")
+
+    # Put the summary directly below the selectors so the headline performance
+    # and risk metrics are visible before the detailed charts.
+    return_paths = dict(returns)
+    st.subheader("Trade Summary")
+    st.dataframe(
+        trade_stats(combos, return_paths),
+        width="stretch",
+        hide_index=True,
     )
 
     st.plotly_chart(price_with_trades(price, combos), width="stretch")
     st.plotly_chart(position_lines(combos), width="stretch")
 
-    finals = {label: float(series.iloc[-1]) for label, series in returns}
-    st.subheader("交易统计 Trade summary")
-    st.dataframe(trade_stats(combos, finals), width="stretch", hide_index=True)
-
-    st.subheader("累计收益对比 Cumulative return")
+    st.subheader("Cumulative Return")
     st.caption(
-        "每个【实验 · 算法】组合在测试区间内的累计收益(%)，颜色与上方买卖点、持仓图一致。"
+        "Cumulative return (%) over the test window. Colors match the trade-marker and "
+        "position charts above."
     )
     st.plotly_chart(cumulative_return_lines(returns), width="stretch")
