@@ -5,8 +5,9 @@
 invested; the book is long-only, so no short selling). The environment
 translates that target into trades, books transaction costs, optionally
 enforces stop-loss / drawdown hard limits (both off by default, so risk is
-reward-driven), and rewards the agent with a Differential Sharpe Ratio plus
-penalties for drawdown and turnover.
+reward-driven), and rewards the agent with either the realized net return
+(default) or a Differential Sharpe Ratio, plus penalties for drawdown,
+downside returns, and turnover.
 """
 
 from __future__ import annotations
@@ -67,6 +68,17 @@ class RiskConfig:
     turnover_coeff: float = 0.1
     sharpe_coeff: float = 1.0
     dsr_eta: float = 0.01
+    # Downside-asymmetric shaping (B1): charge an extra penalty proportional to
+    # the negative part of the step return, so a losing day hurts more than an
+    # equal winning day helps (loss aversion). Applies in both reward modes;
+    # 0.0 disables. For the return objective this is the recommended lever to
+    # trade a little return for shallower drawdowns.
+    downside_coeff: float = 0.0
+    # Terminal max-drawdown penalty (B3): at episode end subtract
+    # ``maxdd_coeff * abs(deepest drawdown reached)``. Encodes "control the worst
+    # drawdown" as the path statistic it is; a one-shot terminal signal, so it
+    # needs a larger coefficient than the per-step penalties to bite. 0.0 disables.
+    maxdd_coeff: float = 0.0
     # Volatility position-scaling. When on, the agent's target is multiplied by
     # ``base_atr / current_atr`` (clamped) before clipping -- classic vol
     # targeting. Off by default: the agent already controls size directly in
@@ -300,6 +312,7 @@ class PositionMgmtEnv(gymnasium.Env):
         self._cash = self.risk.initial_cash
         self._equity = self.risk.initial_cash
         self._peak_equity = self.risk.initial_cash
+        self._max_drawdown_seen = 0.0
         self._holding_days = 0
         self._stopped_out = False
         self._dd_locked = False
@@ -368,6 +381,7 @@ class PositionMgmtEnv(gymnasium.Env):
             "peak_equity": self._peak_equity,
             "drawdown": (self._equity - self._peak_equity)
             / max(self._peak_equity, EPS),
+            "max_drawdown_seen": self._max_drawdown_seen,
             "holding_days": self._holding_days,
             "total_profit": self._equity / self.risk.initial_cash,
             "stop_loss_events": self._stop_loss_events,
@@ -558,11 +572,22 @@ class PositionMgmtEnv(gymnasium.Env):
         self, net_return: float, delta_position: float, trend_score: float
     ) -> float:
         drawdown = (self._equity - self._peak_equity) / max(self._peak_equity, EPS)
+        self._max_drawdown_seen = min(self._max_drawdown_seen, drawdown)
         # Penalise only the downside of drawdown and only churn; both scale with
         # their coefficients. Drawdown is already <= 0, so ``min(drawdown, 0)``
         # keeps the penalty non-positive.
         drawdown_penalty = min(drawdown, 0.0) * self.risk.drawdown_coeff
         turnover_penalty = -abs(delta_position) * self.risk.turnover_coeff
+        # Downside-asymmetric penalty (B1): charge the negative part of the step
+        # return on top of the return term, so a losing day hurts more than an
+        # equal winning day helps (loss aversion). Non-positive; coeff 0 disables.
+        downside_penalty = min(net_return, 0.0) * 100.0 * self.risk.downside_coeff
+        # Terminal max-drawdown penalty (B3): charged once, at episode end,
+        # against the deepest drawdown reached over the path -- the statistic the
+        # objective actually cares about. Non-positive; coeff 0 disables.
+        maxdd_penalty = (
+            self._max_drawdown_seen * self.risk.maxdd_coeff if self._truncated else 0.0
+        )
         # Optional: reward holding a long aligned with the trend judgment
         # (positive when long in an uptrend, negative when long into a
         # downtrend; flat earns nothing). Off by default (coeff 0).
@@ -572,28 +597,26 @@ class PositionMgmtEnv(gymnasium.Env):
             * trend_score
         )
 
+        shared_penalty = (
+            drawdown_penalty
+            + turnover_penalty
+            + downside_penalty
+            + maxdd_penalty
+            + align_bonus
+        )
+
         if self.risk.reward_mode == "dsr":
             # Legacy Differential Sharpe Ratio: scale-invariant risk-adjusted
             # signal. Rewards smoothness but is nearly indifferent to how much
             # money is made (a half-sized and a full-sized winning position earn
             # almost the same reward), so it under-participates in trends.
             sharpe_component = self._dsr.update(net_return)
-            reward = (
-                sharpe_component * self.risk.sharpe_coeff
-                + drawdown_penalty
-                + turnover_penalty
-                + align_bonus
-            )
+            reward = sharpe_component * self.risk.sharpe_coeff + shared_penalty
         else:
             # Return-driven objective (default): pay the realized net return
             # (in percent) so the agent is directly rewarded for capturing --
             # and for sizing up into -- a profitable move.
-            reward = (
-                net_return * 100.0
-                + drawdown_penalty
-                + turnover_penalty
-                + align_bonus
-            )
+            reward = net_return * 100.0 + shared_penalty
         if not np.isfinite(reward):
             return 0.0
         return float(reward)

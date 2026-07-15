@@ -205,6 +205,8 @@ def _build_envs(config: ExperimentConfig, df, train_bound, test_bound):
             turnover_coeff=config.turnover_coeff,
             sharpe_coeff=config.sharpe_coeff,
             dsr_eta=config.dsr_eta,
+            downside_coeff=config.downside_coeff,
+            maxdd_coeff=config.maxdd_coeff,
             use_vol_scaling=config.use_vol_scaling,
             use_trend_features=config.use_trend_features,
             use_trend_prior=config.use_trend_prior,

@@ -41,6 +41,15 @@ class ExperimentConfig:
     turnover_coeff: float = 0.1
     sharpe_coeff: float = 1.0
     dsr_eta: float = 0.01
+    # Downside-asymmetric reward shaping (B1) and terminal max-drawdown penalty
+    # (B3), both opt-in (0.0 disables) and consumed only by env_type ==
+    # "position". Pair with reward_mode == "return" to keep total return the
+    # primary objective while actively controlling drawdown: downside_coeff makes
+    # losing days hurt more than equal winning days help; maxdd_coeff charges the
+    # episode's worst drawdown once at the end (needs a larger value to bite,
+    # since it is a one-shot terminal signal).
+    downside_coeff: float = 0.0
+    maxdd_coeff: float = 0.0
     # Volatility position-scaling (classic vol targeting). Off by default: the
     # agent controls size directly and the scaling silently capped trend capture.
     use_vol_scaling: bool = False
