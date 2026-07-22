@@ -166,6 +166,172 @@ def test_drawdown_lock_disabled_when_non_positive():
             break
 
 
+# --------------------------------------------------------------------------- #
+# Reward modes: return-driven (default) vs legacy scale-invariant DSR
+# --------------------------------------------------------------------------- #
+def _cumulative_reward(df, action: float, **risk_kwargs) -> float:
+    """Sum the per-step reward for a constant action over a full episode."""
+    env = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(60, len(df)),
+        risk_config=RiskConfig(**risk_kwargs),
+    )
+    env.reset(seed=0)
+    total, done = 0.0, False
+    while not done:
+        _, reward, term, trunc, _ = env.step(np.array([action], dtype=np.float32))
+        total += reward
+        done = term or trunc
+    return total
+
+
+@pytest.mark.unit
+def test_reward_mode_defaults_to_return():
+    assert RiskConfig().reward_mode == "return"
+
+
+@pytest.mark.unit
+def test_return_reward_rewards_sizing_into_uptrend(trending_ohlc):
+    """Return mode: on an uptrend, bigger long => strictly more reward.
+
+    This is the property the DSR reward lacked -- it is what makes the agent
+    want to participate in (and size up into) a profitable trend.
+    """
+    flat = _cumulative_reward(trending_ohlc, 0.0, reward_mode="return")
+    half = _cumulative_reward(trending_ohlc, 0.5, reward_mode="return")
+    full = _cumulative_reward(trending_ohlc, 1.0, reward_mode="return")
+    assert full > half > flat
+    assert flat == pytest.approx(0.0, abs=1e-6)  # flat earns (and risks) nothing
+
+
+@pytest.mark.unit
+def test_return_reward_tracks_realized_profit(trending_ohlc):
+    """Return-mode cumulative reward moves with realized profit across sizes.
+
+    The whole point of the return objective: more profit => more reward. (The
+    legacy DSR objective is scale-invariant and breaks this on real noisy data,
+    which is why the agents under-participated in the trend.)
+    """
+    profits, rewards = [], []
+    for action in (0.25, 0.5, 1.0):
+        env = PositionMgmtEnv(
+            df=trending_ohlc,
+            window_size=20,
+            frame_bound=(60, len(trending_ohlc)),
+            risk_config=RiskConfig(reward_mode="return"),
+        )
+        env.reset(seed=0)
+        total, done, info = 0.0, False, {}
+        while not done:
+            _, reward, term, trunc, info = env.step(np.array([action], dtype=np.float32))
+            total += reward
+            done = term or trunc
+        profits.append(info["total_profit"])
+        rewards.append(total)
+    # Both profit and reward are strictly increasing in position size.
+    assert profits[0] < profits[1] < profits[2]
+    assert rewards[0] < rewards[1] < rewards[2]
+
+
+# --------------------------------------------------------------------------- #
+# Downside-asymmetric penalty (B1) + terminal max-drawdown penalty (B3)
+# --------------------------------------------------------------------------- #
+def _run_episode(df, action: float, frame_start: int = 60, **risk_kwargs):
+    """Run a constant-action episode; return ``(total_reward, final_info)``."""
+    env = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(frame_start, len(df)),
+        risk_config=RiskConfig(**risk_kwargs),
+    )
+    env.reset(seed=0)
+    total, done, info = 0.0, False, {}
+    while not done:
+        _, reward, term, trunc, info = env.step(np.array([action], dtype=np.float32))
+        total += reward
+        done = term or trunc
+    return total, info
+
+
+@pytest.mark.unit
+def test_downside_and_maxdd_penalties_default_off():
+    cfg = RiskConfig()
+    assert cfg.downside_coeff == 0.0
+    assert cfg.maxdd_coeff == 0.0
+
+
+@pytest.mark.unit
+def test_info_reports_max_drawdown_seen(env):
+    _, info = env.reset(seed=0)
+    assert info["max_drawdown_seen"] == 0.0
+    for _ in range(10):
+        _, _, term, trunc, info = env.step(np.array([1.0], dtype=np.float32))
+        assert info["max_drawdown_seen"] <= 0.0  # a drawdown metric is never positive
+        if term or trunc:
+            break
+
+
+@pytest.mark.unit
+def test_downside_penalty_charges_only_the_negative_return_part():
+    """B1: cumulative reward drops by exactly coeff * sum(min(net_return, 0)) * 100."""
+    df = _declining_ohlc()
+    coeff = 0.5
+    base_total, base_info = _run_episode(df, 1.0, downside_coeff=0.0)
+    pen_total, _ = _run_episode(df, 1.0, downside_coeff=coeff)
+    returns = base_info["returns"]
+    expected_penalty = coeff * sum(min(r, 0.0) for r in returns) * 100.0
+    assert expected_penalty < 0.0  # a full long on a downtrend has losing steps
+    assert pen_total == pytest.approx(base_total + expected_penalty)
+    assert pen_total < base_total
+
+
+@pytest.mark.unit
+def test_downside_penalty_preserves_uptrend_sizing(trending_ohlc):
+    """B1 must not invert "size into an uptrend": return stays the primary driver."""
+    flat = _cumulative_reward(trending_ohlc, 0.0, reward_mode="return", downside_coeff=0.5)
+    half = _cumulative_reward(trending_ohlc, 0.5, reward_mode="return", downside_coeff=0.5)
+    full = _cumulative_reward(trending_ohlc, 1.0, reward_mode="return", downside_coeff=0.5)
+    assert full > half > flat
+
+
+@pytest.mark.unit
+def test_maxdd_penalty_charged_once_against_worst_drawdown():
+    """B3: the only reward difference is a single terminal coeff * max_drawdown_seen."""
+    df = _declining_ohlc()
+    coeff = 10.0
+    base_total, _ = _run_episode(df, 1.0, maxdd_coeff=0.0)
+    pen_total, pen_info = _run_episode(df, 1.0, maxdd_coeff=coeff)
+    max_dd = pen_info["max_drawdown_seen"]
+    assert max_dd < 0.0  # a full long on a sustained downtrend draws down
+    assert pen_total == pytest.approx(base_total + coeff * max_dd)
+    assert pen_total < base_total
+
+
+@pytest.mark.unit
+def test_maxdd_penalty_not_charged_before_episode_end():
+    """B3 is terminal-only: a mid-episode step is identical with or without it."""
+    df = _declining_ohlc()
+    with_pen = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(60, len(df)),
+        risk_config=RiskConfig(maxdd_coeff=10.0),
+    )
+    without = PositionMgmtEnv(
+        df=df,
+        window_size=20,
+        frame_bound=(60, len(df)),
+        risk_config=RiskConfig(maxdd_coeff=0.0),
+    )
+    with_pen.reset(seed=0)
+    without.reset(seed=0)
+    _, r_with, term, trunc, _ = with_pen.step(np.array([1.0], dtype=np.float32))
+    _, r_without, _, _, _ = without.step(np.array([1.0], dtype=np.float32))
+    assert not (term or trunc)  # the first step is not the episode end
+    assert r_with == pytest.approx(r_without)
+
+
 @pytest.mark.unit
 def test_episode_terminates_at_frame_end(synthetic_ohlc):
     env = PositionMgmtEnv(
@@ -343,18 +509,38 @@ def test_regime_cap_blocks_counter_trend():
 
 
 @pytest.mark.unit
-def test_trend_prior_off_matches_volatility_scaling(synthetic_ohlc):
-    """Both trend switches off => target is exactly the legacy vol-scaled action."""
+def test_default_target_passes_action_through(synthetic_ohlc):
+    """Default config (vol scaling off): the target is just the clipped action."""
     env = PositionMgmtEnv(
         df=synthetic_ohlc,
         window_size=20,
         frame_bound=(20, len(synthetic_ohlc)),
-        risk_config=RiskConfig(),  # defaults: use_trend_prior=False, caps off
+        risk_config=RiskConfig(),  # defaults: use_vol_scaling=False
+    )
+    env.reset(seed=0)
+    _, _, _, _, info = env.step(np.array([0.5], dtype=np.float32))
+    assert info["position_ratio"] == pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_vol_scaling_opt_in_matches_scaled_target(synthetic_ohlc):
+    """With vol scaling on, the target is exactly the vol-scaled action."""
+    env = PositionMgmtEnv(
+        df=synthetic_ohlc,
+        window_size=20,
+        frame_bound=(20, len(synthetic_ohlc)),
+        risk_config=RiskConfig(use_vol_scaling=True),
     )
     env.reset(seed=0)
     expected = env._volatility_scaled_target(0.5)  # same tick as the first step
     _, _, _, _, info = env.step(np.array([0.5], dtype=np.float32))
     assert info["position_ratio"] == pytest.approx(expected)
+
+
+@pytest.mark.unit
+def test_vol_scaling_off_by_default():
+    """Volatility scaling ships opt-in (off), so a 1.0 target isn't silently cut."""
+    assert RiskConfig().use_vol_scaling is False
 
 
 @pytest.mark.unit

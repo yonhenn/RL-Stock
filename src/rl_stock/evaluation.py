@@ -8,6 +8,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from tqdm import tqdm
 
 from rl_stock.risk import (
+    EPS,
     compute_calmar_ratio,
     compute_max_drawdown,
     compute_sharpe_ratio,
@@ -77,6 +78,40 @@ def evaluate_model(
         infos.append(info)
 
     return rewards, profits, infos
+
+
+def buy_and_hold_result(env, num_episodes: int = 1) -> dict:
+    """Full-long buy-and-hold benchmark over the environment's test window.
+
+    Computed straight from the price series (not from the env's reward / position
+    dynamics) so it is a clean "just hold the index" reference: buy at the first
+    tradable tick and hold to the end. Shaped like a model result dict so it
+    flows through :func:`summarize_results` and the risk-metric helpers.
+    """
+    prices = np.asarray(env.prices, dtype=float)
+    start = int(env.window_size)
+    end = int(getattr(env, "_end_tick", len(prices) - 1))
+    path = prices[start : end + 1]
+    if path.size < 2 or path[0] <= 0:
+        return {"profits": [1.0] * num_episodes, "rewards": [0.0] * num_episodes, "infos": [{}]}
+
+    initial_cash = float(getattr(getattr(env, "risk", None), "initial_cash", 1.0))
+    equity_curve = (initial_cash * path / path[0]).tolist()
+    returns = (np.diff(path) / np.maximum(path[:-1], EPS)).tolist()
+    total_profit = float(path[-1] / path[0])
+    info = {
+        "total_profit": total_profit,
+        "equity_curve": equity_curve,
+        "returns": returns,
+        "position_history": [1.0] * path.size,
+        "trade_returns": [total_profit - 1.0],
+        "stop_loss_events": 0,
+    }
+    return {
+        "profits": [total_profit] * num_episodes,
+        "rewards": [0.0] * num_episodes,
+        "infos": [info],
+    }
 
 
 def _risk_stats_from_infos(infos: list[dict]) -> dict[str, float]:

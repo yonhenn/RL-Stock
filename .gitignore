@@ -8,3 +8,8 @@ output.xlsx
 *.bak
 # Generated analysis report (regenerate via scripts/generate_regime_performance.py)
 regime_performance.html
+
+# Presentation decks and large media (kept out of git)
+*.pptx
+*.mp4
+Pre 3 Final Presentation/

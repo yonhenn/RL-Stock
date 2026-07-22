@@ -34,10 +34,25 @@ class ExperimentConfig:
     max_drawdown_pct: float = 0.0
     trade_fee_rate: float = 0.001
     vol_target: float = 0.02
-    drawdown_coeff: float = 0.5
+    # Reward objective: "return" (default, profit-seeking) or "dsr" (legacy
+    # scale-invariant Differential Sharpe). See envs_v2.RiskConfig.
+    reward_mode: str = "return"
+    drawdown_coeff: float = 0.1
     turnover_coeff: float = 0.1
     sharpe_coeff: float = 1.0
     dsr_eta: float = 0.01
+    # Downside-asymmetric reward shaping (B1) and terminal max-drawdown penalty
+    # (B3), both opt-in (0.0 disables) and consumed only by env_type ==
+    # "position". Pair with reward_mode == "return" to keep total return the
+    # primary objective while actively controlling drawdown: downside_coeff makes
+    # losing days hurt more than equal winning days help; maxdd_coeff charges the
+    # episode's worst drawdown once at the end (needs a larger value to bite,
+    # since it is a one-shot terminal signal).
+    downside_coeff: float = 0.0
+    maxdd_coeff: float = 0.0
+    # Volatility position-scaling (classic vol targeting). Off by default: the
+    # agent controls size directly and the scaling silently capped trend capture.
+    use_vol_scaling: bool = False
     # Upgrade the state space with trend-aware features (SMA slope, BB width,
     # ADX, MACD golden/death cross, trend score, regime). Only consumed by
     # env_type == "position".
