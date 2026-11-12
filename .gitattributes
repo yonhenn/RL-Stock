@@ -1,0 +1,4 @@
+# The root-level *.html files are exported reports (presentations, algorithm
+# comparisons), not source code. Marking them as generated keeps them out of
+# GitHub's language statistics, so the repository is recognized as Python.
+*.html linguist-generated
